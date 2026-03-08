@@ -1,0 +1,549 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
+/*
+ * ptt_client.c
+ * Copyright (C) 2026 Resilience Theatre
+ */
+
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <gst/app/app.h>
+#include <gst/gst.h>
+#include <linux/input.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdatomic.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
+
+#define SERVER_PORT 5000
+#define LOCAL_PORT 0
+#define MAX_PACKET 1600
+#define PKT_IDLE 0
+#define PKT_AUDIO 1
+#define INPUT_SCAN_MAX 64
+#define TALK_ID_MAX 31
+
+typedef struct __attribute__((packed)) {
+    uint8_t type;
+    uint16_t len;
+    char talk_id[TALK_ID_MAX + 1];
+} packet_hdr_t;
+
+typedef struct {
+    int sock;
+    struct sockaddr_in server_addr;
+    atomic_int running;
+    atomic_int ptt_pressed;
+    atomic_int suppress_playback;
+    int ptt_enabled;
+    char txid[TALK_ID_MAX + 1];
+    char last_rx_talk_id[TALK_ID_MAX + 1];
+
+    GstElement *capture_pipeline;
+    GstElement *capture_sink;
+
+    GstElement *playback_pipeline;
+    GstElement *playback_src;
+
+    atomic_ulong tx_audio_packets;
+    atomic_ulong tx_idle_packets;
+    atomic_ulong rx_audio_packets;
+    atomic_ulong rx_played_packets;
+    atomic_ulong rx_ignored_idle_packets;
+
+    pthread_t key_thread;
+    pthread_t send_thread;
+    pthread_t recv_thread;
+} app_t;
+
+static app_t g_app;
+
+static long long now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+}
+
+static void msleep_int(int ms) {
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (ms % 1000) * 1000000L;
+    nanosleep(&ts, NULL);
+}
+
+static void on_sigint(int sig) {
+    (void)sig;
+    atomic_store(&g_app.running, 0);
+}
+
+static void sanitize_talk_id(const char *src, char out[TALK_ID_MAX + 1]) {
+    size_t j = 0;
+    if (!src || !src[0]) {
+        snprintf(out, TALK_ID_MAX + 1, "anon");
+        return;
+    }
+    for (size_t i = 0; src[i] && j < TALK_ID_MAX; ++i) {
+        unsigned char c = (unsigned char)src[i];
+        if ((c >= 'A' && c <= 'Z') ||
+            (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') ||
+            c == '_' || c == '-' || c == '.') {
+            out[j++] = (char)c;
+        } else if (c == ' ') {
+            out[j++] = '_';
+        }
+    }
+    if (j == 0) {
+        snprintf(out, TALK_ID_MAX + 1, "anon");
+        return;
+    }
+    out[j] = '\0';
+}
+
+static int make_udp_socket(const char *server_ip, struct sockaddr_in *out_addr) {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        perror("socket");
+        return -1;
+    }
+
+    struct sockaddr_in local_addr;
+    memset(&local_addr, 0, sizeof(local_addr));
+    local_addr.sin_family = AF_INET;
+    local_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    local_addr.sin_port = htons(LOCAL_PORT);
+
+    if (bind(fd, (struct sockaddr *)&local_addr, sizeof(local_addr)) < 0) {
+        perror("bind");
+        close(fd);
+        return -1;
+    }
+
+    memset(out_addr, 0, sizeof(*out_addr));
+    out_addr->sin_family = AF_INET;
+    out_addr->sin_port = htons(SERVER_PORT);
+    if (inet_pton(AF_INET, server_ip, &out_addr->sin_addr) != 1) {
+        fprintf(stderr, "invalid server ip: %s\n", server_ip);
+        close(fd);
+        return -1;
+    }
+
+    if (connect(fd, (struct sockaddr *)out_addr, sizeof(*out_addr)) < 0) {
+        perror("connect");
+        close(fd);
+        return -1;
+    }
+
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 200000;
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+        perror("setsockopt(SO_RCVTIMEO)");
+    }
+
+    return fd;
+}
+
+static GstElement *make_capture_pipeline(GstElement **out_sink) {
+    GError *err = NULL;
+    const char *desc =
+        "autoaudiosrc ! "
+        "audio/x-raw,format=S16LE,channels=1,rate=48000 ! "
+        "audioconvert ! audioresample ! "
+        "opusenc frame-size=20 bitrate=24000 audio-type=voice ! "
+        "appsink name=capture_sink emit-signals=false sync=false max-buffers=8 drop=true";
+
+    GstElement *pipeline = gst_parse_launch(desc, &err);
+    if (!pipeline) {
+        fprintf(stderr, "capture pipeline error: %s\n", err ? err->message : "unknown");
+        if (err) g_error_free(err);
+        return NULL;
+    }
+
+    *out_sink = gst_bin_get_by_name(GST_BIN(pipeline), "capture_sink");
+    if (!*out_sink) {
+        fprintf(stderr, "failed to get capture_sink\n");
+        gst_object_unref(pipeline);
+        return NULL;
+    }
+
+    gst_element_set_state(pipeline, GST_STATE_PLAYING);
+    return pipeline;
+}
+
+static GstElement *make_playback_pipeline(GstElement **out_src) {
+    GError *err = NULL;
+    const char *desc =
+        "appsrc name=play_src is-live=true format=time block=false do-timestamp=true ! "
+        "opusdec ! audioconvert ! audioresample ! autoaudiosink";
+
+    GstElement *pipeline = gst_parse_launch(desc, &err);
+    if (!pipeline) {
+        fprintf(stderr, "playback pipeline error: %s\n", err ? err->message : "unknown");
+        if (err) g_error_free(err);
+        return NULL;
+    }
+
+    *out_src = gst_bin_get_by_name(GST_BIN(pipeline), "play_src");
+    if (!*out_src) {
+        fprintf(stderr, "failed to get play_src\n");
+        gst_object_unref(pipeline);
+        return NULL;
+    }
+
+    GstCaps *caps = gst_caps_new_simple("audio/x-opus",
+                                        "channel-mapping-family", G_TYPE_INT, 0,
+                                        NULL);
+    g_object_set(*out_src,
+                 "caps", caps,
+                 "stream-type", 0,
+                 "format", GST_FORMAT_TIME,
+                 NULL);
+    gst_caps_unref(caps);
+
+    gst_element_set_state(pipeline, GST_STATE_PLAYING);
+    return pipeline;
+}
+
+static bool send_packet(app_t *app, uint8_t type, const uint8_t *payload, uint16_t len) {
+    uint8_t buf[MAX_PACKET];
+    if ((size_t)len + sizeof(packet_hdr_t) > sizeof(buf)) {
+        fprintf(stderr, "packet too large: %u\n", len);
+        return false;
+    }
+
+    packet_hdr_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.type = type;
+    hdr.len = htons(len);
+	memcpy(hdr.talk_id, app->txid, strnlen(app->txid, TALK_ID_MAX));
+    memcpy(buf, &hdr, sizeof(hdr));
+    if (len > 0 && payload) {
+        memcpy(buf + sizeof(hdr), payload, len);
+    }
+
+    ssize_t sent = send(app->sock, buf, sizeof(hdr) + len, 0);
+    if (sent < 0) {
+        perror("send");
+        return false;
+    }
+    return true;
+}
+
+static bool play_opus_packet(app_t *app, const uint8_t *data, uint16_t len) {
+    GstBuffer *buffer = gst_buffer_new_allocate(NULL, len, NULL);
+    if (!buffer) {
+        return false;
+    }
+
+    gst_buffer_fill(buffer, 0, data, len);
+    GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(app->playback_src), buffer);
+    return ret == GST_FLOW_OK;
+}
+
+static void *keyboard_thread_main(void *arg) {
+    app_t *app = (app_t *)arg;
+    int fds[INPUT_SCAN_MAX];
+    char paths[INPUT_SCAN_MAX][64];
+    int nfds = 0;
+
+    for (int i = 0; i < INPUT_SCAN_MAX; ++i) {
+        snprintf(paths[i], sizeof(paths[i]), "/dev/input/event%d", i);
+        int fd = open(paths[i], O_RDONLY | O_NONBLOCK);
+        if (fd >= 0) {
+            fds[nfds++] = fd;
+        }
+    }
+
+    if (nfds == 0) {
+        fprintf(stderr, "keyboard debug: no /dev/input/event* readable\n");
+        return NULL;
+    }
+
+    printf("keyboard debug: monitoring Right Alt / AltGr on %d input device(s)\n", nfds);
+    fflush(stdout);
+
+    while (atomic_load(&app->running)) {
+        bool had_event = false;
+        for (int i = 0; i < nfds; ++i) {
+            struct input_event ev;
+            ssize_t n;
+            while ((n = read(fds[i], &ev, sizeof(ev))) == (ssize_t)sizeof(ev)) {
+                had_event = true;
+                if (ev.type == EV_KEY && ev.code == KEY_RIGHTALT) {
+                    int pressed = (ev.value != 0);
+                    int old = atomic_exchange(&app->ptt_pressed, pressed);
+                    atomic_store(&app->suppress_playback, pressed);
+                    if (old != pressed) {
+                        printf("[%lld] PTT %s (txid=%s)\n", now_ms(), pressed ? "DOWN -> sending microphone audio" : "UP -> sending idle frames", app->txid);
+                        fflush(stdout);
+                    }
+                }
+            }
+        }
+        if (!had_event) {
+            msleep_int(10);
+        }
+    }
+
+    for (int i = 0; i < nfds; ++i) {
+        close(fds[i]);
+    }
+    return NULL;
+}
+
+static void *send_thread_main(void *arg) {
+    app_t *app = (app_t *)arg;
+    unsigned long last_report_audio = 0;
+    unsigned long last_report_idle = 0;
+
+    while (atomic_load(&app->running)) {
+        if (atomic_load(&app->ptt_pressed)) {
+            GstSample *sample = gst_app_sink_try_pull_sample(GST_APP_SINK(app->capture_sink), 50 * GST_MSECOND);
+            if (sample) {
+                GstBuffer *buffer = gst_sample_get_buffer(sample);
+                GstMapInfo map;
+                if (gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+                    if (send_packet(app, PKT_AUDIO, map.data, (uint16_t)map.size)) {
+                        unsigned long n = atomic_fetch_add(&app->tx_audio_packets, 1) + 1;
+                        if (n == 1 || n - last_report_audio >= 50) {
+                            printf("[%lld] TX mic audio packet #%lu (%zu bytes opus, txid=%s)\n", now_ms(), n, map.size, app->txid);
+                            fflush(stdout);
+                            last_report_audio = n;
+                        }
+                    }
+                    gst_buffer_unmap(buffer, &map);
+                }
+                gst_sample_unref(sample);
+            } else {
+                if (send_packet(app, PKT_IDLE, NULL, 0)) {
+                    atomic_fetch_add(&app->tx_idle_packets, 1);
+                }
+                msleep_int(20);
+            }
+        } else {
+            if (send_packet(app, PKT_IDLE, NULL, 0)) {
+                unsigned long n = atomic_fetch_add(&app->tx_idle_packets, 1) + 1;
+                if (n == 1 || n - last_report_idle >= 200) {
+                    printf("[%lld] TX idle packet #%lu (txid=%s)\n", now_ms(), n, app->txid);
+                    fflush(stdout);
+                    last_report_idle = n;
+                }
+            }
+            msleep_int(20);
+        }
+    }
+
+    return NULL;
+}
+
+static void *recv_thread_main(void *arg) {
+    app_t *app = (app_t *)arg;
+    uint8_t buf[MAX_PACKET];
+    unsigned long last_report_rx = 0;
+    unsigned long last_report_play = 0;
+
+    while (atomic_load(&app->running)) {
+        ssize_t n = recv(app->sock, buf, sizeof(buf), 0);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                continue;
+            }
+            perror("recv");
+            break;
+        }
+        if ((size_t)n < sizeof(packet_hdr_t)) {
+            continue;
+        }
+
+        packet_hdr_t hdr;
+        memcpy(&hdr, buf, sizeof(hdr));
+        hdr.talk_id[TALK_ID_MAX] = '\0';
+        uint16_t len = ntohs(hdr.len);
+        if ((size_t)n < sizeof(hdr) + len) {
+            continue;
+        }
+
+        if (hdr.type == PKT_IDLE) {
+            unsigned long idle_n = atomic_fetch_add(&app->rx_ignored_idle_packets, 1) + 1;
+            if (idle_n == 1 || idle_n % 200 == 0) {
+                printf("[%lld] RX idle packet ignored #%lu (from=%s)\n", now_ms(), idle_n, hdr.talk_id[0] ? hdr.talk_id : "?");
+                fflush(stdout);
+            }
+            continue;
+        }
+
+        if (hdr.type != PKT_AUDIO || len == 0) {
+            continue;
+        }
+
+        unsigned long rx_n = atomic_fetch_add(&app->rx_audio_packets, 1) + 1;
+        if (strcmp(app->last_rx_talk_id, hdr.talk_id) != 0) {
+            strncpy(app->last_rx_talk_id, hdr.talk_id, TALK_ID_MAX);
+            app->last_rx_talk_id[TALK_ID_MAX] = '\0';
+            printf("[%lld] TALKER now: %s\n", now_ms(), hdr.talk_id[0] ? hdr.talk_id : "?");
+            fflush(stdout);
+        }
+        if (rx_n == 1 || rx_n - last_report_rx >= 50) {
+            printf("[%lld] RX audio packet #%lu (%u bytes opus, from=%s)\n", now_ms(), rx_n, len, hdr.talk_id[0] ? hdr.talk_id : "?");
+            fflush(stdout);
+            last_report_rx = rx_n;
+        }
+
+        if (atomic_load(&app->suppress_playback)) {
+            if (rx_n == 1 || rx_n % 50 == 0) {
+                printf("[%lld] RX audio suppressed while local PTT is active (from=%s)\n", now_ms(), hdr.talk_id[0] ? hdr.talk_id : "?");
+                fflush(stdout);
+            }
+            continue;
+        }
+
+        if (play_opus_packet(app, buf + sizeof(hdr), len)) {
+            unsigned long play_n = atomic_fetch_add(&app->rx_played_packets, 1) + 1;
+            if (play_n == 1 || play_n - last_report_play >= 50) {
+                printf("[%lld] PLAY audio packet #%lu (from=%s)\n", now_ms(), play_n, hdr.talk_id[0] ? hdr.talk_id : "?");
+                fflush(stdout);
+                last_report_play = play_n;
+            }
+        }
+    }
+
+    return NULL;
+}
+
+static void cleanup(app_t *app) {
+    atomic_store(&app->running, 0);
+
+    if (app->key_thread) pthread_join(app->key_thread, NULL);
+    if (app->send_thread) pthread_join(app->send_thread, NULL);
+    if (app->recv_thread) pthread_join(app->recv_thread, NULL);
+
+    if (app->capture_pipeline) {
+        gst_element_set_state(app->capture_pipeline, GST_STATE_NULL);
+        if (app->capture_sink) gst_object_unref(app->capture_sink);
+        gst_object_unref(app->capture_pipeline);
+    }
+
+    if (app->playback_pipeline) {
+        gst_element_set_state(app->playback_pipeline, GST_STATE_NULL);
+        if (app->playback_src) {
+            gst_app_src_end_of_stream(GST_APP_SRC(app->playback_src));
+            gst_object_unref(app->playback_src);
+        }
+        gst_object_unref(app->playback_pipeline);
+    }
+
+    if (app->sock >= 0) {
+        close(app->sock);
+        app->sock = -1;
+    }
+
+    printf("summary: txid=%s tx_audio=%lu tx_idle=%lu rx_audio=%lu played=%lu rx_idle_ignored=%lu\n",
+           app->txid,
+           (unsigned long)atomic_load(&app->tx_audio_packets),
+           (unsigned long)atomic_load(&app->tx_idle_packets),
+           (unsigned long)atomic_load(&app->rx_audio_packets),
+           (unsigned long)atomic_load(&app->rx_played_packets),
+           (unsigned long)atomic_load(&app->rx_ignored_idle_packets));
+}
+
+int main(int argc, char **argv) {
+    memset(&g_app, 0, sizeof(g_app));
+    g_app.sock = -1;
+    g_app.ptt_enabled = 1;
+    sanitize_talk_id("anon", g_app.txid);
+
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s <server-ip> [--rx-only|--no-ptt] [--txid NAME]\n", argv[0]);
+        return 1;
+    }
+
+    for (int i = 2; i < argc; ++i) {
+        if (strcmp(argv[i], "--rx-only") == 0 || strcmp(argv[i], "--no-ptt") == 0) {
+            g_app.ptt_enabled = 0;
+        } else if (strcmp(argv[i], "--txid") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "missing value after --txid\n");
+                return 1;
+            }
+            sanitize_talk_id(argv[++i], g_app.txid);
+        } else {
+            fprintf(stderr, "unknown option: %s\n", argv[i]);
+            fprintf(stderr, "usage: %s <server-ip> [--rx-only|--no-ptt] [--txid NAME]\n", argv[0]);
+            return 1;
+        }
+    }
+
+    signal(SIGINT, on_sigint);
+    signal(SIGTERM, on_sigint);
+
+    gst_init(&argc, &argv);
+
+    g_app.sock = make_udp_socket(argv[1], &g_app.server_addr);
+    if (g_app.sock < 0) {
+        return 1;
+    }
+
+    if (g_app.ptt_enabled) {
+        g_app.capture_pipeline = make_capture_pipeline(&g_app.capture_sink);
+        if (!g_app.capture_pipeline) {
+            cleanup(&g_app);
+            return 1;
+        }
+    }
+
+    g_app.playback_pipeline = make_playback_pipeline(&g_app.playback_src);
+    if (!g_app.playback_pipeline) {
+        cleanup(&g_app);
+        return 1;
+    }
+
+    atomic_store(&g_app.running, 1);
+    atomic_store(&g_app.ptt_pressed, 0);
+    atomic_store(&g_app.suppress_playback, 0);
+
+    printf("connected to %s:%d\n", argv[1], SERVER_PORT);
+    printf("debug: shows PTT state, transmitted mic packets, received audio packets, and playback events\n");
+    printf("txid: %s\n", g_app.txid);
+    if (!g_app.ptt_enabled) {
+        printf("mode: receive-only (--rx-only), keyboard PTT disabled, microphone capture disabled\n");
+    }
+    fflush(stdout);
+
+    if (g_app.ptt_enabled) {
+        if (pthread_create(&g_app.key_thread, NULL, keyboard_thread_main, &g_app) != 0) {
+            perror("pthread_create(key_thread)");
+            cleanup(&g_app);
+            return 1;
+        }
+    }
+    if (pthread_create(&g_app.send_thread, NULL, send_thread_main, &g_app) != 0) {
+        perror("pthread_create(send_thread)");
+        cleanup(&g_app);
+        return 1;
+    }
+    if (pthread_create(&g_app.recv_thread, NULL, recv_thread_main, &g_app) != 0) {
+        perror("pthread_create(recv_thread)");
+        cleanup(&g_app);
+        return 1;
+    }
+
+    while (atomic_load(&g_app.running)) {
+        msleep_int(100);
+    }
+
+    cleanup(&g_app);
+    return 0;
+}
