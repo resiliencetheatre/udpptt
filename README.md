@@ -8,18 +8,30 @@ Files:
   - Makefile
 
 Build:
-  make
+  
+```
+make
+```
 
 Run server:
-  ./ptt_server
+
+```  
+./ptt_server
+```
 
 Run client:
-  ./ptt_client <server-ip> [--txid <callsign>] [--rx-only]
-  ./ptt_client <server-ip> [--txid <callsign>] [--no-ptt]
+
+```
+./ptt_client <server-ip> [--txid <callsign>] [--rx-only]
+./ptt_client <server-ip> [--txid <callsign>] [--no-ptt]
+```
 
 Examples:
-  ./ptt_client 198.51.100.10 --txid Alpha
-  ./ptt_client 198.51.100.10 --txid Bravo --rx-only
+
+```  
+./ptt_client 198.51.100.10 --txid Alpha
+./ptt_client 198.51.100.10 --txid Bravo --rx-only
+```
 
 Notes:
   - The client continuously sends UDP packets to the server from one local UDP socket.
@@ -35,11 +47,12 @@ Notes:
 
 Packages typically needed on Debian/Ubuntu:
 
-  sudo apt install build-essential pkg-config \
+```
+sudo apt install build-essential pkg-config \
       libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
       gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
       gstreamer1.0-plugins-bad gstreamer1.0-tools
-
+```
 License
 =======
 
