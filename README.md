@@ -3,27 +3,40 @@
 Simple UDP push-to-talk audio test program using a client/server model.
 
 Files:
+
   - ptt_client.c
   - ptt_server.c
   - Makefile
 
 Build:
+
+```
   make
+```
 
 Run server:
+
+```
   ./ptt_server
+```
 
 Run client:
+
+```
   ./ptt_client <server-ip> [--txid <callsign>] [--rx-only]
   ./ptt_client <server-ip> [--txid <callsign>] [--no-ptt]
   ./ptt_client <server-ip> [--txid <callsign>] [--encrypt] [--key <password>]
   UDPPTT_KEY='<password>' ./ptt_client <server-ip> [--txid <callsign>] [--encrypt]
+```
 
 Examples:
+
+```
   ./ptt_client 198.51.100.10 --txid Alpha
   ./ptt_client 198.51.100.10 --txid Bravo --rx-only
   ./ptt_client 198.51.100.10 --txid Alpha --encrypt --key 'shared room secret'
   UDPPTT_KEY='shared room secret' ./ptt_client 198.51.100.10 --txid Bravo --rx-only --encrypt
+```
 
 Notes:
   - The client continuously sends UDP packets to the server from one local UDP socket.
@@ -44,10 +57,12 @@ Notes:
 
 Packages typically needed on Debian/Ubuntu:
 
+```
   sudo apt install build-essential pkg-config libsodium-dev \
       libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
       gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
       gstreamer1.0-plugins-bad gstreamer1.0-tools
+```
 
 License
 =======
