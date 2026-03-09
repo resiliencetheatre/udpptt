@@ -1,10 +1,3 @@
-/* SPDX-License-Identifier: GPL-3.0-or-later */
-
-/*
- * ptt_client.c
- * Copyright (C) 2026 Resilience Theatre
- */
-
 #include <arpa/inet.h>
 #include <errno.h>
 #include <signal.h>
@@ -24,14 +17,18 @@
 #define MAX_CLIENTS 128
 #define PKT_IDLE 0
 #define PKT_AUDIO 1
+#define PKT_FLAG_ENCRYPTED 0x01
 #define CLIENT_TIMEOUT_MS 30000
 #define TALKER_HOLD_MS 1000
 #define TALK_ID_MAX 31
+#define NONCE_SIZE 24
 
 typedef struct __attribute__((packed)) {
     uint8_t type;
+    uint8_t flags;
     uint16_t len;
     char talk_id[TALK_ID_MAX + 1];
+    uint8_t nonce[NONCE_SIZE];
 } packet_hdr_t;
 
 typedef struct {
@@ -103,11 +100,11 @@ static void remove_stale_clients(client_t *clients, int *active_talker) {
         }
         if (now - clients[i].last_seen_ms > CLIENT_TIMEOUT_MS) {
             char who[64];
+            char old_id[TALK_ID_MAX + 1];
+            snprintf(old_id, sizeof(old_id), "%s", clients[i].last_talk_id);
             addr_to_text(&clients[i].addr, who, sizeof(who));
             printf("[%lld] client timeout removed: %s id=%s (rx_idle=%lu rx_audio=%lu tx_audio=%lu)\n",
-                   now,
-                   who,
-                   id_or_q(clients[i].last_talk_id),
+                   now, who, id_or_q(old_id),
                    clients[i].rx_idle_packets,
                    clients[i].rx_audio_packets,
                    clients[i].tx_audio_packets);
@@ -115,7 +112,7 @@ static void remove_stale_clients(client_t *clients, int *active_talker) {
             clients[i].used = 0;
             if (*active_talker == i) {
                 *active_talker = -1;
-                printf("[%lld] active talker released due to timeout: %s id=%s\n", now, who, id_or_q(clients[i].last_talk_id));
+                printf("[%lld] active talker released due to timeout: %s id=%s\n", now, who, id_or_q(old_id));
                 fflush(stdout);
             }
         }
@@ -166,7 +163,7 @@ int main(void) {
     unsigned long total_forwarded = 0;
 
     printf("ptt_server listening on UDP port %d\n", SERVER_PORT);
-    printf("protocol: type=0 idle, type=1 opus audio, talk_id field included on all packets\n");
+    printf("protocol: type=0 idle, type=1 opus audio, talk_id cleartext, optional encrypted payload forwarding\n");
     printf("policy: first client sending audio gets talker slot until %d ms of silence\n", TALKER_HOLD_MS);
     fflush(stdout);
 
@@ -218,9 +215,8 @@ int main(void) {
             fflush(stdout);
         }
         clients[idx].last_seen_ms = now;
+        memset(clients[idx].last_talk_id, 0, sizeof(clients[idx].last_talk_id));
         memcpy(clients[idx].last_talk_id, hdr.talk_id, strnlen(hdr.talk_id, TALK_ID_MAX));
-		clients[idx].last_talk_id[TALK_ID_MAX] = '\0';
-        clients[idx].last_talk_id[TALK_ID_MAX] = '\0';
 
         if (hdr.type == PKT_IDLE) {
             total_rx_idle++;
@@ -228,7 +224,10 @@ int main(void) {
             if (clients[idx].rx_idle_packets == 1 || clients[idx].rx_idle_packets % 500 == 0) {
                 char who[64];
                 addr_to_text(&clients[idx].addr, who, sizeof(who));
-                printf("[%lld] RX idle from %s id=%s (#%lu)\n", now, who, id_or_q(hdr.talk_id), clients[idx].rx_idle_packets);
+                printf("[%lld] RX idle from %s id=%s%s (#%lu)\n",
+                       now, who, id_or_q(hdr.talk_id),
+                       (hdr.flags & PKT_FLAG_ENCRYPTED) ? " enc" : "",
+                       clients[idx].rx_idle_packets);
                 fflush(stdout);
             }
         } else if (hdr.type == PKT_AUDIO && len > 0) {
@@ -240,7 +239,9 @@ int main(void) {
                 active_talker_last_audio_ms = now;
                 char who[64];
                 addr_to_text(&clients[idx].addr, who, sizeof(who));
-                printf("[%lld] active talker granted to %s id=%s\n", now, who, id_or_q(hdr.talk_id));
+                printf("[%lld] active talker granted to %s id=%s%s\n",
+                       now, who, id_or_q(hdr.talk_id),
+                       (hdr.flags & PKT_FLAG_ENCRYPTED) ? " enc" : "");
                 fflush(stdout);
             }
 
@@ -265,63 +266,34 @@ int main(void) {
                 if (clients[idx].rx_audio_packets == 1 || clients[idx].rx_audio_packets % 50 == 0) {
                     char who[64];
                     addr_to_text(&clients[idx].addr, who, sizeof(who));
-                    printf("[%lld] RX audio from active talker %s id=%s (#%lu, %u bytes opus), forwarded to %lu client(s)\n",
-                           now,
-                           who,
-                           id_or_q(hdr.talk_id),
-                           clients[idx].rx_audio_packets,
-                           len,
+                    printf("[%lld] RX audio from active talker %s id=%s (#%lu, %u bytes payload%s), forwarded to %lu client(s)\n",
+                           now, who, id_or_q(hdr.talk_id), clients[idx].rx_audio_packets, len,
+                           (hdr.flags & PKT_FLAG_ENCRYPTED) ? ", encrypted" : "",
                            forwarded_this_packet);
                     fflush(stdout);
                 }
             } else {
-                if (clients[idx].rx_audio_packets == 1 || clients[idx].rx_audio_packets % 50 == 0) {
-                    char who[64], owner[64];
+                if (clients[idx].rx_audio_packets == 1 || clients[idx].rx_audio_packets % 20 == 0) {
+                    char who[64];
+                    char active_who[64];
                     addr_to_text(&clients[idx].addr, who, sizeof(who));
-                    addr_to_text(&clients[active_talker].addr, owner, sizeof(owner));
-                    printf("[%lld] RX audio from %s id=%s ignored, active talker is %s id=%s\n",
-                           now,
-                           who,
-                           id_or_q(hdr.talk_id),
-                           owner,
-                           id_or_q(clients[active_talker].last_talk_id));
+                    if (active_talker >= 0 && clients[active_talker].used) {
+                        addr_to_text(&clients[active_talker].addr, active_who, sizeof(active_who));
+                    } else {
+                        snprintf(active_who, sizeof(active_who), "?");
+                    }
+                    printf("[%lld] audio ignored from non-active talker %s id=%s; active is %s id=%s\n",
+                           now, who, id_or_q(hdr.talk_id),
+                           active_who,
+                           (active_talker >= 0 && clients[active_talker].used) ? id_or_q(clients[active_talker].last_talk_id) : "?");
                     fflush(stdout);
                 }
             }
-        } else {
-            char who[64];
-            addr_to_text(&clients[idx].addr, who, sizeof(who));
-            printf("[%lld] unknown packet type=%u len=%u from %s id=%s ignored\n",
-                   now, hdr.type, len, who, id_or_q(hdr.talk_id));
-            fflush(stdout);
-        }
-
-        remove_stale_clients(clients, &active_talker);
-        if (active_talker >= 0 && now - active_talker_last_audio_ms > TALKER_HOLD_MS) {
-            char who[64];
-            addr_to_text(&clients[active_talker].addr, who, sizeof(who));
-            printf("[%lld] active talker released after silence: %s id=%s\n", now, who, id_or_q(clients[active_talker].last_talk_id));
-            fflush(stdout);
-            active_talker = -1;
         }
     }
 
     printf("summary: total_rx_idle=%lu total_rx_audio=%lu total_forwarded=%lu\n",
            total_rx_idle, total_rx_audio, total_forwarded);
-
-    for (int i = 0; i < MAX_CLIENTS; ++i) {
-        if (clients[i].used) {
-            char who[64];
-            addr_to_text(&clients[i].addr, who, sizeof(who));
-            printf("client %s id=%s: rx_idle=%lu rx_audio=%lu tx_audio=%lu\n",
-                   who,
-                   id_or_q(clients[i].last_talk_id),
-                   clients[i].rx_idle_packets,
-                   clients[i].rx_audio_packets,
-                   clients[i].tx_audio_packets);
-        }
-    }
-
     close(sock);
     return 0;
 }
