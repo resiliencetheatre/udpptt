@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -23,28 +25,23 @@
 
 #define SERVER_PORT 5000
 #define LOCAL_PORT 0
-#define MAX_PACKET 1600
+#define MAX_PACKET 2048
 #define PKT_IDLE 0
 #define PKT_AUDIO 1
-#define PKT_FLAG_ENCRYPTED 0x01
 #define INPUT_SCAN_MAX 64
 #define TALK_ID_MAX 31
-#define NONCE_SIZE 24
-#define ROOM_SALT_CONTEXT "udpptt-room-key-v1"
+#define PKT_FLAG_ENCRYPTED 0x01
+#define NONCE_LEN crypto_aead_xchacha20poly1305_ietf_NPUBBYTES
+#define KEY_LEN crypto_aead_xchacha20poly1305_ietf_KEYBYTES
+#define AAD_LEN (1 + 1 + (TALK_ID_MAX + 1))
 
 typedef struct __attribute__((packed)) {
     uint8_t type;
     uint8_t flags;
     uint16_t len;
     char talk_id[TALK_ID_MAX + 1];
-    uint8_t nonce[NONCE_SIZE];
+    uint8_t nonce[NONCE_LEN];
 } packet_hdr_t;
-
-typedef struct __attribute__((packed)) {
-    uint8_t type;
-    uint8_t flags;
-    char talk_id[TALK_ID_MAX + 1];
-} packet_ad_t;
 
 typedef struct {
     int sock;
@@ -55,8 +52,7 @@ typedef struct {
     int ptt_enabled;
     int encrypt_enabled;
     char txid[TALK_ID_MAX + 1];
-    char last_rx_talk_id[TALK_ID_MAX + 1];
-    unsigned char room_key[crypto_aead_xchacha20poly1305_ietf_KEYBYTES];
+    unsigned char key[KEY_LEN];
 
     GstElement *capture_pipeline;
     GstElement *capture_sink;
@@ -69,7 +65,7 @@ typedef struct {
     atomic_ulong rx_audio_packets;
     atomic_ulong rx_played_packets;
     atomic_ulong rx_ignored_idle_packets;
-    atomic_ulong rx_auth_fail_packets;
+    atomic_ulong rx_decrypt_failures;
 
     pthread_t key_thread;
     pthread_t send_thread;
@@ -77,6 +73,11 @@ typedef struct {
 } app_t;
 
 static app_t g_app;
+
+static const unsigned char g_pwhash_salt[crypto_pwhash_SALTBYTES] = {
+    0x75, 0x64, 0x70, 0x70, 0x74, 0x74, 0x2d, 0x78,
+    0x63, 0x68, 0x61, 0x63, 0x68, 0x61, 0x32, 0x30
+};
 
 static long long now_ms(void) {
     struct timespec ts;
@@ -96,28 +97,46 @@ static void on_sigint(int sig) {
     atomic_store(&g_app.running, 0);
 }
 
-static void sanitize_talk_id(const char *src, char out[TALK_ID_MAX + 1]) {
+static void sanitize_txid(char *dst, size_t dst_sz, const char *src) {
     size_t j = 0;
     if (!src || !src[0]) {
-        snprintf(out, TALK_ID_MAX + 1, "anon");
+        snprintf(dst, dst_sz, "anon");
         return;
     }
-    for (size_t i = 0; src[i] && j < TALK_ID_MAX; ++i) {
+    for (size_t i = 0; src[i] != '\0' && j + 1 < dst_sz; ++i) {
         unsigned char c = (unsigned char)src[i];
-        if ((c >= 'A' && c <= 'Z') ||
-            (c >= 'a' && c <= 'z') ||
+        if ((c >= 'a' && c <= 'z') ||
+            (c >= 'A' && c <= 'Z') ||
             (c >= '0' && c <= '9') ||
             c == '_' || c == '-' || c == '.') {
-            out[j++] = (char)c;
+            dst[j++] = (char)c;
         } else if (c == ' ') {
-            out[j++] = '_';
+            dst[j++] = '_';
         }
     }
     if (j == 0) {
-        snprintf(out, TALK_ID_MAX + 1, "anon");
-        return;
+        snprintf(dst, dst_sz, "anon");
+    } else {
+        dst[j] = '\0';
     }
-    out[j] = '\0';
+}
+
+static int derive_key_from_password(const char *password, unsigned char out_key[KEY_LEN]) {
+    if (!password || !password[0]) {
+        return -1;
+    }
+    if (crypto_pwhash(out_key,
+                      KEY_LEN,
+                      password,
+                      strlen(password),
+                      g_pwhash_salt,
+                      crypto_pwhash_OPSLIMIT_INTERACTIVE,
+                      crypto_pwhash_MEMLIMIT_INTERACTIVE,
+                      crypto_pwhash_ALG_DEFAULT) != 0) {
+        fprintf(stderr, "crypto_pwhash failed (out of memory?)\n");
+        return -1;
+    }
+    return 0;
 }
 
 static int make_udp_socket(const char *server_ip, struct sockaddr_in *out_addr) {
@@ -195,7 +214,7 @@ static GstElement *make_playback_pipeline(GstElement **out_src) {
     GError *err = NULL;
     const char *desc =
         "appsrc name=play_src is-live=true format=time block=false do-timestamp=true ! "
-        "opusdec ! audioconvert ! audioresample ! autoaudiosink";
+        "opusparse ! opusdec ! audioconvert ! audioresample ! autoaudiosink";
 
     GstElement *pipeline = gst_parse_launch(desc, &err);
     if (!pipeline) {
@@ -225,132 +244,68 @@ static GstElement *make_playback_pipeline(GstElement **out_src) {
     return pipeline;
 }
 
-static void fill_packet_ad(packet_ad_t *ad, uint8_t type, uint8_t flags, const char *talk_id) {
-    memset(ad, 0, sizeof(*ad));
-    ad->type = type;
-    ad->flags = flags;
-    memcpy(ad->talk_id, talk_id, strnlen(talk_id, TALK_ID_MAX));
+static void make_aad(uint8_t type, uint8_t flags, const char talk_id[TALK_ID_MAX + 1], unsigned char aad[AAD_LEN]) {
+    memset(aad, 0, AAD_LEN);
+    aad[0] = type;
+    aad[1] = flags;
+    memcpy(aad + 2, talk_id, strnlen(talk_id, TALK_ID_MAX + 1));
 }
 
-static int derive_room_key_from_password(const char *password, unsigned char key[crypto_aead_xchacha20poly1305_ietf_KEYBYTES]) {
-    unsigned char salt[crypto_pwhash_SALTBYTES];
-    memset(salt, 0, sizeof(salt));
-    crypto_generichash(salt, sizeof(salt),
-                       (const unsigned char *)ROOM_SALT_CONTEXT, strlen(ROOM_SALT_CONTEXT),
-                       NULL, 0);
-    return crypto_pwhash(key,
-                         crypto_aead_xchacha20poly1305_ietf_KEYBYTES,
-                         password,
-                         strlen(password),
-                         salt,
-                         crypto_pwhash_OPSLIMIT_INTERACTIVE,
-                         crypto_pwhash_MEMLIMIT_INTERACTIVE,
-                         crypto_pwhash_ALG_DEFAULT);
-}
-
-static bool send_packet(app_t *app, uint8_t type, const uint8_t *payload, uint16_t len) {
+static bool send_packet(app_t *app, uint8_t type, const uint8_t *payload, uint16_t plain_len) {
     uint8_t buf[MAX_PACKET];
-    uint8_t tmp[MAX_PACKET];
     packet_hdr_t hdr;
-    packet_ad_t ad;
-    size_t hdr_sz = sizeof(hdr);
-
     memset(&hdr, 0, sizeof(hdr));
     hdr.type = type;
-    memcpy(hdr.talk_id, app->txid, strnlen(app->txid, TALK_ID_MAX));
+    memcpy(hdr.talk_id, app->txid, strnlen(app->txid, TALK_ID_MAX + 1));
 
-    if (!app->encrypt_enabled) {
-        if ((size_t)len + hdr_sz > sizeof(buf)) {
-            fprintf(stderr, "packet too large: %u\n", len);
+    unsigned long long wire_len = plain_len;
+    const uint8_t *wire_payload = payload;
+    unsigned char cipher[MAX_PACKET];
+
+    if (type == PKT_AUDIO && app->encrypt_enabled) {
+        hdr.flags |= PKT_FLAG_ENCRYPTED;
+        randombytes_buf(hdr.nonce, sizeof(hdr.nonce));
+
+        unsigned char aad[AAD_LEN];
+        make_aad(hdr.type, hdr.flags, hdr.talk_id, aad);
+
+        if (sizeof(hdr) + plain_len + crypto_aead_xchacha20poly1305_ietf_ABYTES > sizeof(buf) ||
+            plain_len + crypto_aead_xchacha20poly1305_ietf_ABYTES > sizeof(cipher)) {
+            fprintf(stderr, "encrypted packet too large: %u\n", plain_len);
             return false;
         }
-        hdr.flags = 0;
-        hdr.len = htons(len);
-        memcpy(buf, &hdr, hdr_sz);
-        if (len > 0 && payload) {
-            memcpy(buf + hdr_sz, payload, len);
-        }
-        if (send(app->sock, buf, hdr_sz + len, 0) < 0) {
-            perror("send");
+
+        if (crypto_aead_xchacha20poly1305_ietf_encrypt(cipher,
+                                                       &wire_len,
+                                                       payload,
+                                                       plain_len,
+                                                       aad,
+                                                       sizeof(aad),
+                                                       NULL,
+                                                       hdr.nonce,
+                                                       app->key) != 0) {
+            fprintf(stderr, "encrypt failed\n");
             return false;
         }
-        return true;
+        wire_payload = cipher;
     }
 
-    fill_packet_ad(&ad, type, PKT_FLAG_ENCRYPTED, app->txid);
-    randombytes_buf(hdr.nonce, sizeof(hdr.nonce));
-    hdr.flags = PKT_FLAG_ENCRYPTED;
-
-    unsigned long long clen = 0;
-    if (crypto_aead_xchacha20poly1305_ietf_encrypt(tmp,
-                                                   &clen,
-                                                   payload,
-                                                   len,
-                                                   (const unsigned char *)&ad,
-                                                   sizeof(ad),
-                                                   NULL,
-                                                   hdr.nonce,
-                                                   app->room_key) != 0) {
-        fprintf(stderr, "encryption failed\n");
+    if (sizeof(hdr) + wire_len > sizeof(buf)) {
+        fprintf(stderr, "packet too large: %llu\n", wire_len);
         return false;
     }
 
-    if (hdr_sz + clen > sizeof(buf)) {
-        fprintf(stderr, "encrypted packet too large: %llu\n", clen);
-        return false;
+    hdr.len = htons((uint16_t)wire_len);
+    memcpy(buf, &hdr, sizeof(hdr));
+    if (wire_len > 0 && wire_payload) {
+        memcpy(buf + sizeof(hdr), wire_payload, (size_t)wire_len);
     }
 
-    hdr.len = htons((uint16_t)clen);
-    memcpy(buf, &hdr, hdr_sz);
-    if (clen > 0) {
-        memcpy(buf + hdr_sz, tmp, (size_t)clen);
-    }
-
-    if (send(app->sock, buf, hdr_sz + (size_t)clen, 0) < 0) {
+    ssize_t sent = send(app->sock, buf, sizeof(hdr) + (size_t)wire_len, 0);
+    if (sent < 0) {
         perror("send");
         return false;
     }
-    return true;
-}
-
-static bool decode_payload(app_t *app,
-                           const packet_hdr_t *hdr,
-                           const uint8_t *wire_payload,
-                           uint16_t wire_len,
-                           uint8_t *out,
-                           uint16_t *out_len) {
-    if (!(hdr->flags & PKT_FLAG_ENCRYPTED)) {
-        if (wire_len > 0) {
-            memcpy(out, wire_payload, wire_len);
-        }
-        *out_len = wire_len;
-        return true;
-    }
-
-    if (!app->encrypt_enabled) {
-        return false;
-    }
-
-    packet_ad_t ad;
-    fill_packet_ad(&ad, hdr->type, hdr->flags, hdr->talk_id);
-
-    unsigned long long plain_len = 0;
-    if (crypto_aead_xchacha20poly1305_ietf_decrypt(out,
-                                                   &plain_len,
-                                                   NULL,
-                                                   wire_payload,
-                                                   wire_len,
-                                                   (const unsigned char *)&ad,
-                                                   sizeof(ad),
-                                                   hdr->nonce,
-                                                   app->room_key) != 0) {
-        return false;
-    }
-
-    if (plain_len > UINT16_MAX) {
-        return false;
-    }
-    *out_len = (uint16_t)plain_len;
     return true;
 }
 
@@ -399,7 +354,8 @@ static void *keyboard_thread_main(void *arg) {
                     int old = atomic_exchange(&app->ptt_pressed, pressed);
                     atomic_store(&app->suppress_playback, pressed);
                     if (old != pressed) {
-                        printf("[%lld] PTT %s (txid=%s)\n", now_ms(),
+                        printf("[%lld] PTT %s (txid=%s)\n",
+                               now_ms(),
                                pressed ? "DOWN -> sending microphone audio" : "UP -> sending idle frames",
                                app->txid);
                         fflush(stdout);
@@ -424,7 +380,7 @@ static void *send_thread_main(void *arg) {
     unsigned long last_report_idle = 0;
 
     while (atomic_load(&app->running)) {
-        if (atomic_load(&app->ptt_pressed)) {
+        if (app->ptt_enabled && atomic_load(&app->ptt_pressed)) {
             GstSample *sample = gst_app_sink_try_pull_sample(GST_APP_SINK(app->capture_sink), 50 * GST_MSECOND);
             if (sample) {
                 GstBuffer *buffer = gst_sample_get_buffer(sample);
@@ -433,9 +389,10 @@ static void *send_thread_main(void *arg) {
                     if (send_packet(app, PKT_AUDIO, map.data, (uint16_t)map.size)) {
                         unsigned long n = atomic_fetch_add(&app->tx_audio_packets, 1) + 1;
                         if (n == 1 || n - last_report_audio >= 50) {
-                            printf("[%lld] TX mic audio packet #%lu (%zu bytes opus, txid=%s%s)\n",
-                                   now_ms(), n, map.size, app->txid,
-                                   app->encrypt_enabled ? ", enc=xchacha20poly1305" : "");
+                            printf("[%lld] TX mic audio packet #%lu (%zu bytes opus%s, txid=%s)\n",
+                                   now_ms(), n, map.size,
+                                   app->encrypt_enabled ? ", enc" : "",
+                                   app->txid);
                             fflush(stdout);
                             last_report_audio = n;
                         }
@@ -453,9 +410,7 @@ static void *send_thread_main(void *arg) {
             if (send_packet(app, PKT_IDLE, NULL, 0)) {
                 unsigned long n = atomic_fetch_add(&app->tx_idle_packets, 1) + 1;
                 if (n == 1 || n - last_report_idle >= 200) {
-                    printf("[%lld] TX idle packet #%lu (txid=%s%s)\n",
-                           now_ms(), n, app->txid,
-                           app->encrypt_enabled ? ", enc=xchacha20poly1305" : "");
+                    printf("[%lld] TX idle packet #%lu (txid=%s)\n", now_ms(), n, app->txid);
                     fflush(stdout);
                     last_report_idle = n;
                 }
@@ -470,9 +425,9 @@ static void *send_thread_main(void *arg) {
 static void *recv_thread_main(void *arg) {
     app_t *app = (app_t *)arg;
     uint8_t buf[MAX_PACKET];
-    uint8_t plain[MAX_PACKET];
     unsigned long last_report_rx = 0;
     unsigned long last_report_play = 0;
+    char current_talker[TALK_ID_MAX + 1] = {0};
 
     while (atomic_load(&app->running)) {
         ssize_t n = recv(app->sock, buf, sizeof(buf), 0);
@@ -490,66 +445,90 @@ static void *recv_thread_main(void *arg) {
         packet_hdr_t hdr;
         memcpy(&hdr, buf, sizeof(hdr));
         hdr.talk_id[TALK_ID_MAX] = '\0';
-        uint16_t wire_len = ntohs(hdr.len);
-        if ((size_t)n < sizeof(hdr) + wire_len) {
+        uint16_t len = ntohs(hdr.len);
+        if ((size_t)n < sizeof(hdr) + len) {
             continue;
-        }
-
-        uint16_t plain_len = 0;
-        if (!decode_payload(app, &hdr, buf + sizeof(hdr), wire_len, plain, &plain_len)) {
-            unsigned long bad = atomic_fetch_add(&app->rx_auth_fail_packets, 1) + 1;
-            if (bad == 1 || bad % 50 == 0) {
-                printf("[%lld] RX auth/decrypt failed #%lu (from=%s, flags=0x%02x)\n",
-                       now_ms(), bad, hdr.talk_id[0] ? hdr.talk_id : "?", hdr.flags);
-                fflush(stdout);
-            }
-            continue;
-        }
-
-        if (strcmp(app->last_rx_talk_id, hdr.talk_id) != 0 && hdr.talk_id[0]) {
-            snprintf(app->last_rx_talk_id, sizeof(app->last_rx_talk_id), "%s", hdr.talk_id);
-            printf("[%lld] TALKER now: %s\n", now_ms(), app->last_rx_talk_id);
-            fflush(stdout);
         }
 
         if (hdr.type == PKT_IDLE) {
             unsigned long idle_n = atomic_fetch_add(&app->rx_ignored_idle_packets, 1) + 1;
             if (idle_n == 1 || idle_n % 200 == 0) {
-                printf("[%lld] RX idle packet ignored #%lu (from=%s%s)\n",
-                       now_ms(), idle_n, hdr.talk_id[0] ? hdr.talk_id : "?",
-                       (hdr.flags & PKT_FLAG_ENCRYPTED) ? ", encrypted" : "");
+                printf("[%lld] RX idle packet ignored #%lu (from=%s)\n", now_ms(), idle_n, hdr.talk_id);
                 fflush(stdout);
             }
             continue;
         }
 
-        if (hdr.type != PKT_AUDIO || plain_len == 0) {
+        if (hdr.type != PKT_AUDIO || len == 0) {
             continue;
+        }
+
+        if (strcmp(current_talker, hdr.talk_id) != 0) {
+            snprintf(current_talker, sizeof(current_talker), "%s", hdr.talk_id);
+            printf("[%lld] TALKER now: %s\n", now_ms(), current_talker[0] ? current_talker : "?");
+            fflush(stdout);
+        }
+
+        unsigned char plain[MAX_PACKET];
+        const uint8_t *opus = buf + sizeof(hdr);
+        unsigned long long opus_len = len;
+
+        if (hdr.flags & PKT_FLAG_ENCRYPTED) {
+            if (!app->encrypt_enabled) {
+                unsigned long bad = atomic_fetch_add(&app->rx_decrypt_failures, 1) + 1;
+                if (bad == 1 || bad % 50 == 0) {
+                    printf("[%lld] RX encrypted audio from=%s but local client is not in --encrypt mode\n", now_ms(), hdr.talk_id);
+                    fflush(stdout);
+                }
+                continue;
+            }
+
+            unsigned char aad[AAD_LEN];
+            make_aad(hdr.type, hdr.flags, hdr.talk_id, aad);
+            if (crypto_aead_xchacha20poly1305_ietf_decrypt(plain,
+                                                           &opus_len,
+                                                           NULL,
+                                                           buf + sizeof(hdr),
+                                                           len,
+                                                           aad,
+                                                           sizeof(aad),
+                                                           hdr.nonce,
+                                                           app->key) != 0) {
+                unsigned long bad = atomic_fetch_add(&app->rx_decrypt_failures, 1) + 1;
+                if (bad == 1 || bad % 50 == 0) {
+                    printf("[%lld] RX decrypt/auth failure #%lu from=%s\n", now_ms(), bad, hdr.talk_id);
+                    fflush(stdout);
+                }
+                continue;
+            }
+            opus = plain;
         }
 
         unsigned long rx_n = atomic_fetch_add(&app->rx_audio_packets, 1) + 1;
         if (rx_n == 1 || rx_n - last_report_rx >= 50) {
-            printf("[%lld] RX audio packet #%lu (%u bytes opus, from=%s%s)\n",
-                   now_ms(), rx_n, plain_len, hdr.talk_id[0] ? hdr.talk_id : "?",
-                   (hdr.flags & PKT_FLAG_ENCRYPTED) ? ", encrypted" : "");
+            printf("[%lld] RX audio packet #%lu (%llu bytes opus%s, from=%s)\n",
+                   now_ms(), rx_n, opus_len,
+                   (hdr.flags & PKT_FLAG_ENCRYPTED) ? ", enc" : "",
+                   hdr.talk_id);
             fflush(stdout);
             last_report_rx = rx_n;
         }
 
         if (atomic_load(&app->suppress_playback)) {
             if (rx_n == 1 || rx_n % 50 == 0) {
-                printf("[%lld] RX audio suppressed while local PTT is active (from=%s)\n",
-                       now_ms(), hdr.talk_id[0] ? hdr.talk_id : "?");
+                printf("[%lld] RX audio suppressed while local PTT is active (from=%s)\n", now_ms(), hdr.talk_id);
                 fflush(stdout);
             }
             continue;
         }
 
-        if (play_opus_packet(app, plain, plain_len)) {
+        if (opus_len > UINT16_MAX) {
+            continue;
+        }
+        if (play_opus_packet(app, opus, (uint16_t)opus_len)) {
             unsigned long play_n = atomic_fetch_add(&app->rx_played_packets, 1) + 1;
             if (play_n == 1 || play_n - last_report_play >= 50) {
-                printf("[%lld] PLAY audio packet #%lu (from=%s)\n",
-                       now_ms(), play_n, hdr.talk_id[0] ? hdr.talk_id : "?");
+                printf("[%lld] PLAY audio packet #%lu (from=%s)\n", now_ms(), play_n, hdr.talk_id);
                 fflush(stdout);
                 last_report_play = play_n;
             }
@@ -586,32 +565,25 @@ static void cleanup(app_t *app) {
         app->sock = -1;
     }
 
-    sodium_memzero(app->room_key, sizeof(app->room_key));
+    sodium_memzero(app->key, sizeof(app->key));
 
-    printf("summary: tx_audio=%lu tx_idle=%lu rx_audio=%lu played=%lu rx_idle_ignored=%lu rx_auth_fail=%lu\n",
+    printf("summary: tx_audio=%lu tx_idle=%lu rx_audio=%lu played=%lu rx_idle_ignored=%lu decrypt_fail=%lu\n",
            (unsigned long)atomic_load(&app->tx_audio_packets),
            (unsigned long)atomic_load(&app->tx_idle_packets),
            (unsigned long)atomic_load(&app->rx_audio_packets),
            (unsigned long)atomic_load(&app->rx_played_packets),
            (unsigned long)atomic_load(&app->rx_ignored_idle_packets),
-           (unsigned long)atomic_load(&app->rx_auth_fail_packets));
-}
-
-static void usage(const char *prog) {
-    fprintf(stderr,
-            "usage: %s <server-ip> [--txid NAME] [--rx-only|--no-ptt] [--encrypt] [--key PASSWORD]\n"
-            "       env: UDPPTT_KEY=PASSWORD (used when --encrypt is set and --key is not)\n",
-            prog);
+           (unsigned long)atomic_load(&app->rx_decrypt_failures));
 }
 
 int main(int argc, char **argv) {
-    const char *server_ip = NULL;
-    const char *password = NULL;
-
     memset(&g_app, 0, sizeof(g_app));
     g_app.sock = -1;
     g_app.ptt_enabled = 1;
-    sanitize_talk_id("anon", g_app.txid);
+    snprintf(g_app.txid, sizeof(g_app.txid), "anon");
+
+    const char *server_ip = NULL;
+    const char *password = NULL;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--rx-only") == 0 || strcmp(argv[i], "--no-ptt") == 0) {
@@ -619,37 +591,36 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--encrypt") == 0) {
             g_app.encrypt_enabled = 1;
         } else if (strcmp(argv[i], "--txid") == 0) {
-            if (++i >= argc) {
-                usage(argv[0]);
+            if (i + 1 >= argc) {
+                fprintf(stderr, "missing value for --txid\n");
                 return 1;
             }
-            sanitize_talk_id(argv[i], g_app.txid);
+            sanitize_txid(g_app.txid, sizeof(g_app.txid), argv[++i]);
         } else if (strcmp(argv[i], "--key") == 0) {
-            if (++i >= argc) {
-                usage(argv[0]);
+            if (i + 1 >= argc) {
+                fprintf(stderr, "missing value for --key\n");
                 return 1;
             }
-            password = argv[i];
+            password = argv[++i];
         } else if (argv[i][0] == '-') {
             fprintf(stderr, "unknown option: %s\n", argv[i]);
-            usage(argv[0]);
+            fprintf(stderr, "usage: %s <server-ip> [--txid NAME] [--rx-only|--no-ptt] [--encrypt] [--key PASSWORD]\n", argv[0]);
             return 1;
         } else if (!server_ip) {
             server_ip = argv[i];
         } else {
-            fprintf(stderr, "unexpected argument: %s\n", argv[i]);
-            usage(argv[0]);
+            fprintf(stderr, "unexpected extra argument: %s\n", argv[i]);
             return 1;
         }
     }
 
     if (!server_ip) {
-        usage(argv[0]);
+        fprintf(stderr, "usage: %s <server-ip> [--txid NAME] [--rx-only|--no-ptt] [--encrypt] [--key PASSWORD]\n", argv[0]);
         return 1;
     }
 
     if (sodium_init() < 0) {
-        fprintf(stderr, "sodium_init failed\n");
+        fprintf(stderr, "libsodium init failed\n");
         return 1;
     }
 
@@ -658,11 +629,10 @@ int main(int argc, char **argv) {
             password = getenv("UDPPTT_KEY");
         }
         if (!password || !password[0]) {
-            fprintf(stderr, "--encrypt requires --key PASSWORD or UDPPTT_KEY in environment\n");
+            fprintf(stderr, "--encrypt requires --key PASSWORD or UDPPTT_KEY\n");
             return 1;
         }
-        if (derive_room_key_from_password(password, g_app.room_key) != 0) {
-            fprintf(stderr, "failed to derive encryption key from password\n");
+        if (derive_key_from_password(password, g_app.key) != 0) {
             return 1;
         }
     }
@@ -674,7 +644,6 @@ int main(int argc, char **argv) {
 
     g_app.sock = make_udp_socket(server_ip, &g_app.server_addr);
     if (g_app.sock < 0) {
-        cleanup(&g_app);
         return 1;
     }
 
@@ -698,12 +667,12 @@ int main(int argc, char **argv) {
 
     printf("connected to %s:%d\n", server_ip, SERVER_PORT);
     printf("txid: %s\n", g_app.txid);
-    printf("debug: shows PTT state, transmitted mic packets, received audio packets, playback events, and talker IDs\n");
+    printf("debug: shows PTT state, transmitted mic packets, received audio packets, and playback events\n");
     if (!g_app.ptt_enabled) {
         printf("mode: receive-only (--rx-only), keyboard PTT disabled, microphone capture disabled\n");
     }
     if (g_app.encrypt_enabled) {
-        printf("encryption: enabled (XChaCha20-Poly1305 AEAD, talk_id cleartext but authenticated)\n");
+        printf("encryption: enabled (XChaCha20-Poly1305 payload encryption, cleartext authenticated talk_id)\n");
     } else {
         printf("encryption: disabled\n");
     }
