@@ -5,8 +5,8 @@
 #include <fcntl.h>
 #include <gst/app/app.h>
 #include <gst/gst.h>
-#include <limits.h>
 #include <linux/input.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
@@ -35,6 +35,7 @@
 #define NONCE_LEN crypto_aead_xchacha20poly1305_ietf_NPUBBYTES
 #define KEY_LEN crypto_aead_xchacha20poly1305_ietf_KEYBYTES
 #define AAD_LEN (1 + 1 + (TALK_ID_MAX + 1))
+#define ALSA_DEV_MAX 128
 
 typedef struct __attribute__((packed)) {
     uint8_t type;
@@ -45,6 +46,11 @@ typedef struct __attribute__((packed)) {
 } packet_hdr_t;
 
 typedef struct {
+    char wav_path[PATH_MAX];
+    char playback_device[ALSA_DEV_MAX];
+} tone_play_req_t;
+
+typedef struct {
     int sock;
     struct sockaddr_in server_addr;
     atomic_int running;
@@ -52,12 +58,17 @@ typedef struct {
     atomic_int suppress_playback;
     int ptt_enabled;
     int encrypt_enabled;
+    int codec_ptt_enabled;
+    char txid[TALK_ID_MAX + 1];
+    unsigned char key[KEY_LEN];
+
+    char alsa_capture_device[ALSA_DEV_MAX];
+    char alsa_playback_device[ALSA_DEV_MAX];
+
     int have_start_wav;
     int have_stop_wav;
-    char txid[TALK_ID_MAX + 1];
     char start_wav_path[PATH_MAX];
     char stop_wav_path[PATH_MAX];
-    unsigned char key[KEY_LEN];
 
     GstElement *capture_pipeline;
     GstElement *capture_sink;
@@ -126,6 +137,32 @@ static void sanitize_txid(char *dst, size_t dst_sz, const char *src) {
     }
 }
 
+static void copy_opt_string(char *dst, size_t dst_sz, const char *src) {
+    if (!dst || dst_sz == 0) {
+        return;
+    }
+    memset(dst, 0, dst_sz);
+    if (!src) {
+        return;
+    }
+    snprintf(dst, dst_sz, "%s", src);
+}
+
+static int is_ptt_key_event(const app_t *app, const struct input_event *ev) {
+    if (!app || !ev) {
+        return 0;
+    }
+    if (ev->type != EV_KEY) {
+        return 0;
+    }
+
+    if (app->codec_ptt_enabled) {
+        return ev->code == KEY_ENTER;
+    }
+
+    return ev->code == KEY_RIGHTALT;
+}
+
 static int derive_key_from_password(const char *password, unsigned char out_key[KEY_LEN]) {
     if (!password || !password[0]) {
         return -1;
@@ -188,14 +225,26 @@ static int make_udp_socket(const char *server_ip, struct sockaddr_in *out_addr) 
     return fd;
 }
 
-static GstElement *make_capture_pipeline(GstElement **out_sink) {
+static GstElement *make_capture_pipeline(GstElement **out_sink, const char *alsa_device) {
     GError *err = NULL;
-    const char *desc =
-        "autoaudiosrc ! "
-        "audio/x-raw,format=S16LE,channels=1,rate=48000 ! "
-        "audioconvert ! audioresample ! "
-        "opusenc frame-size=20 bitrate=24000 audio-type=voice ! "
-        "appsink name=capture_sink emit-signals=false sync=false max-buffers=8 drop=true";
+    char desc[512];
+
+    if (alsa_device && alsa_device[0]) {
+        snprintf(desc, sizeof(desc),
+                 "alsasrc device=\"%s\" ! "
+                 "audio/x-raw,format=S16LE,channels=1,rate=48000 ! "
+                 "audioconvert ! audioresample ! "
+                 "opusenc frame-size=20 bitrate=24000 audio-type=voice ! "
+                 "appsink name=capture_sink emit-signals=false sync=false max-buffers=8 drop=true",
+                 alsa_device);
+    } else {
+        snprintf(desc, sizeof(desc),
+                 "autoaudiosrc ! "
+                 "audio/x-raw,format=S16LE,channels=1,rate=48000 ! "
+                 "audioconvert ! audioresample ! "
+                 "opusenc frame-size=20 bitrate=24000 audio-type=voice ! "
+                 "appsink name=capture_sink emit-signals=false sync=false max-buffers=8 drop=true");
+    }
 
     GstElement *pipeline = gst_parse_launch(desc, &err);
     if (!pipeline) {
@@ -215,11 +264,21 @@ static GstElement *make_capture_pipeline(GstElement **out_sink) {
     return pipeline;
 }
 
-static GstElement *make_playback_pipeline(GstElement **out_src) {
+static GstElement *make_playback_pipeline(GstElement **out_src, const char *alsa_device) {
     GError *err = NULL;
-    const char *desc =
-        "appsrc name=play_src is-live=true format=time block=false do-timestamp=true ! "
-        "opusparse ! opusdec ! audioconvert ! audioresample ! autoaudiosink";
+    char desc[512];
+
+    if (alsa_device && alsa_device[0]) {
+        snprintf(desc, sizeof(desc),
+                 "appsrc name=play_src is-live=true format=time block=false do-timestamp=true ! "
+                 "opusdec ! audioconvert ! audioresample ! "
+                 "alsasink device=\"%s\" sync=false",
+                 alsa_device);
+    } else {
+        snprintf(desc, sizeof(desc),
+                 "appsrc name=play_src is-live=true format=time block=false do-timestamp=true ! "
+                 "opusdec ! audioconvert ! audioresample ! autoaudiosink");
+    }
 
     GstElement *pipeline = gst_parse_launch(desc, &err);
     if (!pipeline) {
@@ -236,6 +295,8 @@ static GstElement *make_playback_pipeline(GstElement **out_src) {
     }
 
     GstCaps *caps = gst_caps_new_simple("audio/x-opus",
+                                        "rate", G_TYPE_INT, 48000,
+                                        "channels", G_TYPE_INT, 1,
                                         "channel-mapping-family", G_TYPE_INT, 0,
                                         NULL);
     g_object_set(*out_src,
@@ -247,81 +308,6 @@ static GstElement *make_playback_pipeline(GstElement **out_src) {
 
     gst_element_set_state(pipeline, GST_STATE_PLAYING);
     return pipeline;
-}
-
-static int file_exists_readable(const char *path) {
-    return path && access(path, R_OK) == 0;
-}
-
-static void init_ptt_tones(app_t *app) {
-    snprintf(app->start_wav_path, sizeof(app->start_wav_path), "start.wav");
-    snprintf(app->stop_wav_path, sizeof(app->stop_wav_path), "stop.wav");
-
-    app->have_start_wav = file_exists_readable(app->start_wav_path);
-    app->have_stop_wav = file_exists_readable(app->stop_wav_path);
-
-    printf("ptt tones: start.wav=%s stop.wav=%s\n",
-           app->have_start_wav ? "yes" : "no",
-           app->have_stop_wav ? "yes" : "no");
-    fflush(stdout);
-}
-
-static void *tone_thread_main(void *arg) {
-    char *path = (char *)arg;
-    if (!path) {
-        return NULL;
-    }
-
-    GError *err = NULL;
-    char desc[PATH_MAX + 128];
-    snprintf(desc, sizeof(desc),
-             "filesrc location=\"%s\" ! wavparse ! audioconvert ! audioresample ! autoaudiosink",
-             path);
-
-    GstElement *pipeline = gst_parse_launch(desc, &err);
-    if (!pipeline) {
-        fprintf(stderr, "tone playback pipeline error for %s: %s\n",
-                path, err ? err->message : "unknown");
-        if (err) g_error_free(err);
-        free(path);
-        return NULL;
-    }
-
-    gst_element_set_state(pipeline, GST_STATE_PLAYING);
-
-    GstBus *bus = gst_element_get_bus(pipeline);
-    if (bus) {
-        GstMessage *msg = gst_bus_timed_pop_filtered(bus,
-                                                     2 * GST_SECOND,
-                                                     GST_MESSAGE_ERROR | GST_MESSAGE_EOS);
-        if (msg) {
-            gst_message_unref(msg);
-        }
-        gst_object_unref(bus);
-    }
-
-    gst_element_set_state(pipeline, GST_STATE_NULL);
-    gst_object_unref(pipeline);
-    free(path);
-    return NULL;
-}
-
-static void play_tone_async(const char *path) {
-    if (!path || !path[0]) {
-        return;
-    }
-
-    char *copy = strdup(path);
-    if (!copy) {
-        return;
-    }
-
-    pthread_t tid;
-    if (pthread_create(&tid, NULL, tone_thread_main, copy) == 0) {
-        pthread_detach(tid);
-    } else {
-        free(copy);
-    }
 }
 
 static void make_aad(uint8_t type, uint8_t flags, const char talk_id[TALK_ID_MAX + 1], unsigned char aad[AAD_LEN]) {
@@ -400,6 +386,89 @@ static bool play_opus_packet(app_t *app, const uint8_t *data, uint16_t len) {
     return ret == GST_FLOW_OK;
 }
 
+static int file_exists_readable(const char *path) {
+    return path && access(path, R_OK) == 0;
+}
+
+static void init_ptt_tones(app_t *app) {
+    snprintf(app->start_wav_path, sizeof(app->start_wav_path), "start.wav");
+    snprintf(app->stop_wav_path, sizeof(app->stop_wav_path), "stop.wav");
+
+    app->have_start_wav = file_exists_readable(app->start_wav_path);
+    app->have_stop_wav = file_exists_readable(app->stop_wav_path);
+
+    printf("ptt tones: start.wav=%s stop.wav=%s\n",
+           app->have_start_wav ? "yes" : "no",
+           app->have_stop_wav ? "yes" : "no");
+    fflush(stdout);
+}
+
+static void *tone_thread_main(void *arg) {
+    tone_play_req_t *req = (tone_play_req_t *)arg;
+    if (!req) {
+        return NULL;
+    }
+
+    GError *err = NULL;
+    char desc[PATH_MAX + ALSA_DEV_MAX + 128];
+
+    if (req->playback_device[0]) {
+        snprintf(desc, sizeof(desc),
+                 "filesrc location=\"%s\" ! wavparse ! audioconvert ! audioresample ! "
+                 "alsasink device=\"%s\" sync=false",
+                 req->wav_path, req->playback_device);
+    } else {
+        snprintf(desc, sizeof(desc),
+                 "filesrc location=\"%s\" ! wavparse ! audioconvert ! audioresample ! autoaudiosink",
+                 req->wav_path);
+    }
+
+    GstElement *pipeline = gst_parse_launch(desc, &err);
+    if (!pipeline) {
+        fprintf(stderr, "tone playback pipeline error for %s: %s\n",
+                req->wav_path, err ? err->message : "unknown");
+        if (err) g_error_free(err);
+        free(req);
+        return NULL;
+    }
+
+    gst_element_set_state(pipeline, GST_STATE_PLAYING);
+
+    GstBus *bus = gst_element_get_bus(pipeline);
+    if (bus) {
+        gst_bus_timed_pop_filtered(bus,
+                                   2 * GST_SECOND,
+                                   GST_MESSAGE_ERROR | GST_MESSAGE_EOS);
+        gst_object_unref(bus);
+    }
+
+    gst_element_set_state(pipeline, GST_STATE_NULL);
+    gst_object_unref(pipeline);
+    free(req);
+    return NULL;
+}
+
+static void play_tone_async(app_t *app, const char *path) {
+    if (!app || !path || !path[0]) {
+        return;
+    }
+
+    tone_play_req_t *req = calloc(1, sizeof(*req));
+    if (!req) {
+        return;
+    }
+
+    snprintf(req->wav_path, sizeof(req->wav_path), "%s", path);
+    snprintf(req->playback_device, sizeof(req->playback_device), "%s", app->alsa_playback_device);
+
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, tone_thread_main, req) == 0) {
+        pthread_detach(tid);
+    } else {
+        free(req);
+    }
+}
+
 static void *keyboard_thread_main(void *arg) {
     app_t *app = (app_t *)arg;
     int fds[INPUT_SCAN_MAX];
@@ -419,7 +488,9 @@ static void *keyboard_thread_main(void *arg) {
         return NULL;
     }
 
-    printf("keyboard debug: monitoring Right Alt / AltGr on %d input device(s)\n", nfds);
+    printf("keyboard debug: monitoring %s on %d input device(s)\n",
+           app->codec_ptt_enabled ? "codec PTT key (KEY_ENTER)" : "Right Alt / AltGr",
+           nfds);
     fflush(stdout);
 
     while (atomic_load(&app->running)) {
@@ -429,7 +500,7 @@ static void *keyboard_thread_main(void *arg) {
             ssize_t n;
             while ((n = read(fds[i], &ev, sizeof(ev))) == (ssize_t)sizeof(ev)) {
                 had_event = true;
-                if (ev.type == EV_KEY && ev.code == KEY_RIGHTALT) {
+                if (is_ptt_key_event(app, &ev)) {
                     int pressed = (ev.value != 0);
                     int old = atomic_exchange(&app->ptt_pressed, pressed);
                     atomic_store(&app->suppress_playback, pressed);
@@ -442,11 +513,11 @@ static void *keyboard_thread_main(void *arg) {
 
                         if (pressed) {
                             if (app->have_start_wav) {
-                                play_tone_async(app->start_wav_path);
+                                play_tone_async(app, app->start_wav_path);
                             }
                         } else {
                             if (app->have_stop_wav) {
-                                play_tone_async(app->stop_wav_path);
+                                play_tone_async(app, app->stop_wav_path);
                             }
                         }
                     }
@@ -680,6 +751,8 @@ int main(int argc, char **argv) {
             g_app.ptt_enabled = 0;
         } else if (strcmp(argv[i], "--encrypt") == 0) {
             g_app.encrypt_enabled = 1;
+        } else if (strcmp(argv[i], "--codec-ptt") == 0) {
+            g_app.codec_ptt_enabled = 1;
         } else if (strcmp(argv[i], "--txid") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "missing value for --txid\n");
@@ -692,9 +765,34 @@ int main(int argc, char **argv) {
                 return 1;
             }
             password = argv[++i];
+        } else if (strcmp(argv[i], "--alsa-device") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "missing value for --alsa-device\n");
+                return 1;
+            }
+            copy_opt_string(g_app.alsa_capture_device, sizeof(g_app.alsa_capture_device), argv[++i]);
+            copy_opt_string(g_app.alsa_playback_device, sizeof(g_app.alsa_playback_device), g_app.alsa_capture_device);
+        } else if (strcmp(argv[i], "--alsa-capture-device") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "missing value for --alsa-capture-device\n");
+                return 1;
+            }
+            copy_opt_string(g_app.alsa_capture_device, sizeof(g_app.alsa_capture_device), argv[++i]);
+        } else if (strcmp(argv[i], "--alsa-playback-device") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "missing value for --alsa-playback-device\n");
+                return 1;
+            }
+            copy_opt_string(g_app.alsa_playback_device, sizeof(g_app.alsa_playback_device), argv[++i]);
+        } else if (strcmp(argv[i], "--rpi-audio") == 0) {
+            copy_opt_string(g_app.alsa_capture_device, sizeof(g_app.alsa_capture_device), "plughw:0,0");
+            copy_opt_string(g_app.alsa_playback_device, sizeof(g_app.alsa_playback_device), "plughw:0,0");
         } else if (argv[i][0] == '-') {
-            fprintf(stderr, "unknown option: %s\n", argv[i]);
-            fprintf(stderr, "usage: %s <server-ip> [--txid NAME] [--rx-only|--no-ptt] [--encrypt] [--key PASSWORD]\n", argv[0]);
+            fprintf(stderr,
+                    "unknown option: %s\n"
+                    "usage: %s <server-ip> [--txid NAME] [--rx-only|--no-ptt] [--encrypt] [--key PASSWORD]\n"
+                    "       [--codec-ptt] [--rpi-audio] [--alsa-device DEV] [--alsa-capture-device DEV] [--alsa-playback-device DEV]\n",
+                    argv[i], argv[0]);
             return 1;
         } else if (!server_ip) {
             server_ip = argv[i];
@@ -705,7 +803,10 @@ int main(int argc, char **argv) {
     }
 
     if (!server_ip) {
-        fprintf(stderr, "usage: %s <server-ip> [--txid NAME] [--rx-only|--no-ptt] [--encrypt] [--key PASSWORD]\n", argv[0]);
+        fprintf(stderr,
+                "usage: %s <server-ip> [--txid NAME] [--rx-only|--no-ptt] [--encrypt] [--key PASSWORD]\n"
+                "       [--codec-ptt] [--rpi-audio] [--alsa-device DEV] [--alsa-capture-device DEV] [--alsa-playback-device DEV]\n",
+                argv[0]);
         return 1;
     }
 
@@ -738,14 +839,14 @@ int main(int argc, char **argv) {
     }
 
     if (g_app.ptt_enabled) {
-        g_app.capture_pipeline = make_capture_pipeline(&g_app.capture_sink);
+        g_app.capture_pipeline = make_capture_pipeline(&g_app.capture_sink, g_app.alsa_capture_device);
         if (!g_app.capture_pipeline) {
             cleanup(&g_app);
             return 1;
         }
     }
 
-    g_app.playback_pipeline = make_playback_pipeline(&g_app.playback_src);
+    g_app.playback_pipeline = make_playback_pipeline(&g_app.playback_src, g_app.alsa_playback_device);
     if (!g_app.playback_pipeline) {
         cleanup(&g_app);
         return 1;
@@ -767,6 +868,17 @@ int main(int argc, char **argv) {
         printf("encryption: enabled (XChaCha20-Poly1305 payload encryption, cleartext authenticated talk_id)\n");
     } else {
         printf("encryption: disabled\n");
+    }
+    printf("ptt input: %s\n", g_app.codec_ptt_enabled ? "codec-ptt (KEY_ENTER)" : "keyboard Right Alt / AltGr");
+    if (g_app.alsa_capture_device[0]) {
+        printf("capture: alsasrc device=\"%s\"\n", g_app.alsa_capture_device);
+    } else {
+        printf("capture: autoaudiosrc\n");
+    }
+    if (g_app.alsa_playback_device[0]) {
+        printf("playback: alsasink device=\"%s\"\n", g_app.alsa_playback_device);
+    } else {
+        printf("playback: autoaudiosink\n");
     }
     fflush(stdout);
 
