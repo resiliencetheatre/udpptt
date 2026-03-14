@@ -1,12 +1,17 @@
 # udpptt
 
+![Intro picture](img/udpptt.png "udpptt diagram")
+
 Simple UDP push-to-talk audio test program using a client/server model.
 
-Files:
+Packages typically needed on Debian/Ubuntu:
 
-  - ptt_client.c
-  - ptt_server.c
-  - Makefile
+```
+  sudo apt install build-essential pkg-config libsodium-dev \
+      libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+      gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+      gstreamer1.0-plugins-bad gstreamer1.0-tools
+```
 
 Build:
 
@@ -55,14 +60,7 @@ Notes:
   - The --rx-only and --no-ptt options disable keyboard PTT handling and microphone capture, but still keep the client connected for receive/playback.
   - The client scans readable /dev/input/event* devices for KEY_RIGHTALT. Membership in the input group is usually enough.
 
-Packages typically needed on Debian/Ubuntu:
 
-```
-  sudo apt install build-essential pkg-config libsodium-dev \
-      libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-      gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
-      gstreamer1.0-plugins-bad gstreamer1.0-tools
-```
 
 License
 =======
