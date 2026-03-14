@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <gst/app/app.h>
 #include <gst/gst.h>
+#include <limits.h>
 #include <linux/input.h>
 #include <netinet/in.h>
 #include <pthread.h>
@@ -51,7 +52,11 @@ typedef struct {
     atomic_int suppress_playback;
     int ptt_enabled;
     int encrypt_enabled;
+    int have_start_wav;
+    int have_stop_wav;
     char txid[TALK_ID_MAX + 1];
+    char start_wav_path[PATH_MAX];
+    char stop_wav_path[PATH_MAX];
     unsigned char key[KEY_LEN];
 
     GstElement *capture_pipeline;
@@ -244,6 +249,81 @@ static GstElement *make_playback_pipeline(GstElement **out_src) {
     return pipeline;
 }
 
+static int file_exists_readable(const char *path) {
+    return path && access(path, R_OK) == 0;
+}
+
+static void init_ptt_tones(app_t *app) {
+    snprintf(app->start_wav_path, sizeof(app->start_wav_path), "start.wav");
+    snprintf(app->stop_wav_path, sizeof(app->stop_wav_path), "stop.wav");
+
+    app->have_start_wav = file_exists_readable(app->start_wav_path);
+    app->have_stop_wav = file_exists_readable(app->stop_wav_path);
+
+    printf("ptt tones: start.wav=%s stop.wav=%s\n",
+           app->have_start_wav ? "yes" : "no",
+           app->have_stop_wav ? "yes" : "no");
+    fflush(stdout);
+}
+
+static void *tone_thread_main(void *arg) {
+    char *path = (char *)arg;
+    if (!path) {
+        return NULL;
+    }
+
+    GError *err = NULL;
+    char desc[PATH_MAX + 128];
+    snprintf(desc, sizeof(desc),
+             "filesrc location=\"%s\" ! wavparse ! audioconvert ! audioresample ! autoaudiosink",
+             path);
+
+    GstElement *pipeline = gst_parse_launch(desc, &err);
+    if (!pipeline) {
+        fprintf(stderr, "tone playback pipeline error for %s: %s\n",
+                path, err ? err->message : "unknown");
+        if (err) g_error_free(err);
+        free(path);
+        return NULL;
+    }
+
+    gst_element_set_state(pipeline, GST_STATE_PLAYING);
+
+    GstBus *bus = gst_element_get_bus(pipeline);
+    if (bus) {
+        GstMessage *msg = gst_bus_timed_pop_filtered(bus,
+                                                     2 * GST_SECOND,
+                                                     GST_MESSAGE_ERROR | GST_MESSAGE_EOS);
+        if (msg) {
+            gst_message_unref(msg);
+        }
+        gst_object_unref(bus);
+    }
+
+    gst_element_set_state(pipeline, GST_STATE_NULL);
+    gst_object_unref(pipeline);
+    free(path);
+    return NULL;
+}
+
+static void play_tone_async(const char *path) {
+    if (!path || !path[0]) {
+        return;
+    }
+
+    char *copy = strdup(path);
+    if (!copy) {
+        return;
+    }
+
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, tone_thread_main, copy) == 0) {
+        pthread_detach(tid);
+    } else {
+        free(copy);
+    }
+}
+
 static void make_aad(uint8_t type, uint8_t flags, const char talk_id[TALK_ID_MAX + 1], unsigned char aad[AAD_LEN]) {
     memset(aad, 0, AAD_LEN);
     aad[0] = type;
@@ -359,6 +439,16 @@ static void *keyboard_thread_main(void *arg) {
                                pressed ? "DOWN -> sending microphone audio" : "UP -> sending idle frames",
                                app->txid);
                         fflush(stdout);
+
+                        if (pressed) {
+                            if (app->have_start_wav) {
+                                play_tone_async(app->start_wav_path);
+                            }
+                        } else {
+                            if (app->have_stop_wav) {
+                                play_tone_async(app->stop_wav_path);
+                            }
+                        }
                     }
                 }
             }
@@ -660,6 +750,8 @@ int main(int argc, char **argv) {
         cleanup(&g_app);
         return 1;
     }
+
+    init_ptt_tones(&g_app);
 
     atomic_store(&g_app.running, 1);
     atomic_store(&g_app.ptt_pressed, 0);
