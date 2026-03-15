@@ -29,6 +29,73 @@ sudo apt install build-essential pkg-config libsodium-dev \
     gstreamer1.0-plugins-bad gstreamer1.0-tools
 ```
 
+## Installation with `make install`
+
+Build and install the binaries, tone files, and user service with:
+
+```sh
+make
+sudo make install
+```
+
+The install step does the following:
+
+- installs `ptt_client` and `ptt_server` to `/usr/local/bin`
+- installs `start.wav` and `stop.wav` to `/opt/udpptt`
+- installs a user systemd service file to:
+
+```text
+~/.config/systemd/user/udpptt.service
+```
+
+- installs a per-user configuration file to:
+
+```text
+~/.config/udpptt/udpptt.env
+```
+
+The service is configured to run with:
+
+```text
+WorkingDirectory=/opt/udpptt
+```
+
+This means `ptt_client` will look for `start.wav` and `stop.wav` from `/opt/udpptt` when started through systemd.
+
+After installation, enable the user service:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now udpptt.service
+```
+
+To view logs:
+
+```sh
+journalctl --user -u udpptt.service -f
+```
+
+## User configuration file
+
+The runtime parameters are read from:
+
+```text
+~/.config/udpptt/udpptt.env
+```
+
+Example:
+
+```sh
+SERVER_IP=198.51.100.10
+CALL_SIGN=Alpha
+WORD_OF_DAY=shared-room-secret
+ALTGR_PTT_DELAY_MS=2000
+```
+
+This file is intended to be edited by the user after installation. It defines the server address, callsign, encryption password, and AltGr PTT hold delay.
+
+## Manual installation steps and details
+
 Build:
 
 ```sh
@@ -150,8 +217,6 @@ This is useful on Buildroot and Raspberry Pi systems where automatic GStreamer a
 - On embedded targets using `--codec-ptt`, make sure the `ptt_keys` input device is accessible to the user running `ptt_client`.
 
 ## systemd service
-
-
 
 ```
 [Unit]
