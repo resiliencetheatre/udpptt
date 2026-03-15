@@ -59,6 +59,7 @@ typedef struct {
     int ptt_enabled;
     int encrypt_enabled;
     int codec_ptt_enabled;
+    int pc_ptt_hold_ms;
     char txid[TALK_ID_MAX + 1];
     unsigned char key[KEY_LEN];
 
@@ -148,20 +149,6 @@ static void copy_opt_string(char *dst, size_t dst_sz, const char *src) {
     snprintf(dst, dst_sz, "%s", src);
 }
 
-static int is_ptt_key_event(const app_t *app, const struct input_event *ev) {
-    if (!app || !ev) {
-        return 0;
-    }
-    if (ev->type != EV_KEY) {
-        return 0;
-    }
-
-    if (app->codec_ptt_enabled) {
-        return ev->code == KEY_ENTER;
-    }
-
-    return ev->code == KEY_RIGHTALT;
-}
 
 static int derive_key_from_password(const char *password, unsigned char out_key[KEY_LEN]) {
     if (!password || !password[0]) {
@@ -469,10 +456,35 @@ static void play_tone_async(app_t *app, const char *path) {
     }
 }
 
+static void set_ptt_state(app_t *app, int pressed) {
+    int old = atomic_exchange(&app->ptt_pressed, pressed);
+    atomic_store(&app->suppress_playback, pressed);
+
+    if (old != pressed) {
+        printf("[%lld] PTT %s (txid=%s)\n",
+               now_ms(),
+               pressed ? "DOWN -> sending microphone audio" : "UP -> sending idle frames",
+               app->txid);
+        fflush(stdout);
+
+        if (pressed) {
+            if (app->have_start_wav) {
+                play_tone_async(app, app->start_wav_path);
+            }
+        } else {
+            if (app->have_stop_wav) {
+                play_tone_async(app, app->stop_wav_path);
+            }
+        }
+    }
+}
+
 static void *keyboard_thread_main(void *arg) {
     app_t *app = (app_t *)arg;
     int fds[INPUT_SCAN_MAX];
     int nfds = 0;
+    int altgr_pending = 0;
+    long long altgr_press_start_ms = 0;
 
     for (int i = 0; i < INPUT_SCAN_MAX; ++i) {
         char path[64];
@@ -488,42 +500,59 @@ static void *keyboard_thread_main(void *arg) {
         return NULL;
     }
 
-    printf("keyboard debug: monitoring %s on %d input device(s)\n",
-           app->codec_ptt_enabled ? "codec PTT key (KEY_ENTER)" : "Right Alt / AltGr",
-           nfds);
+    if (app->codec_ptt_enabled) {
+        printf("keyboard debug: monitoring codec PTT key (KEY_ENTER) on %d input device(s)\n", nfds);
+    } else {
+        printf("keyboard debug: monitoring Right Alt / AltGr on %d input device(s), hold threshold=%d ms\n",
+               nfds, app->pc_ptt_hold_ms);
+    }
     fflush(stdout);
 
     while (atomic_load(&app->running)) {
         bool had_event = false;
+
         for (int i = 0; i < nfds; ++i) {
             struct input_event ev;
             ssize_t n;
             while ((n = read(fds[i], &ev, sizeof(ev))) == (ssize_t)sizeof(ev)) {
                 had_event = true;
-                if (is_ptt_key_event(app, &ev)) {
-                    int pressed = (ev.value != 0);
-                    int old = atomic_exchange(&app->ptt_pressed, pressed);
-                    atomic_store(&app->suppress_playback, pressed);
-                    if (old != pressed) {
-                        printf("[%lld] PTT %s (txid=%s)\n",
-                               now_ms(),
-                               pressed ? "DOWN -> sending microphone audio" : "UP -> sending idle frames",
-                               app->txid);
-                        fflush(stdout);
 
-                        if (pressed) {
-                            if (app->have_start_wav) {
-                                play_tone_async(app, app->start_wav_path);
-                            }
-                        } else {
-                            if (app->have_stop_wav) {
-                                play_tone_async(app, app->stop_wav_path);
-                            }
+                if (ev.type != EV_KEY) {
+                    continue;
+                }
+
+                if (app->codec_ptt_enabled) {
+                    if (ev.code == KEY_ENTER) {
+                        int pressed = (ev.value != 0);
+                        set_ptt_state(app, pressed);
+                    }
+                    continue;
+                }
+
+                if (ev.code == KEY_RIGHTALT) {
+                    if (ev.value != 0) {
+                        if (!altgr_pending && !atomic_load(&app->ptt_pressed)) {
+                            altgr_pending = 1;
+                            altgr_press_start_ms = now_ms();
+                        }
+                    } else {
+                        altgr_pending = 0;
+                        if (atomic_load(&app->ptt_pressed)) {
+                            set_ptt_state(app, 0);
                         }
                     }
                 }
             }
         }
+
+        if (!app->codec_ptt_enabled && altgr_pending && !atomic_load(&app->ptt_pressed)) {
+            long long held_ms = now_ms() - altgr_press_start_ms;
+            if (held_ms >= app->pc_ptt_hold_ms) {
+                altgr_pending = 0;
+                set_ptt_state(app, 1);
+            }
+        }
+
         if (!had_event) {
             msleep_int(10);
         }
@@ -741,6 +770,7 @@ int main(int argc, char **argv) {
     memset(&g_app, 0, sizeof(g_app));
     g_app.sock = -1;
     g_app.ptt_enabled = 1;
+    g_app.pc_ptt_hold_ms = 2000;
     snprintf(g_app.txid, sizeof(g_app.txid), "anon");
 
     const char *server_ip = NULL;
@@ -753,6 +783,18 @@ int main(int argc, char **argv) {
             g_app.encrypt_enabled = 1;
         } else if (strcmp(argv[i], "--codec-ptt") == 0) {
             g_app.codec_ptt_enabled = 1;
+        } else if (strcmp(argv[i], "--altgr-ptt-delay-ms") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "missing value for --altgr-ptt-delay-ms\n");
+                return 1;
+            }
+            char *endp = NULL;
+            long v = strtol(argv[++i], &endp, 10);
+            if (!endp || *endp != '\0' || v < 0 || v > 60000) {
+                fprintf(stderr, "invalid value for --altgr-ptt-delay-ms: %s\n", argv[i]);
+                return 1;
+            }
+            g_app.pc_ptt_hold_ms = (int)v;
         } else if (strcmp(argv[i], "--txid") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "missing value for --txid\n");
@@ -791,7 +833,8 @@ int main(int argc, char **argv) {
             fprintf(stderr,
                     "unknown option: %s\n"
                     "usage: %s <server-ip> [--txid NAME] [--rx-only|--no-ptt] [--encrypt] [--key PASSWORD]\n"
-                    "       [--codec-ptt] [--rpi-audio] [--alsa-device DEV] [--alsa-capture-device DEV] [--alsa-playback-device DEV]\n",
+                    "       [--codec-ptt] [--altgr-ptt-delay-ms MS] [--rpi-audio]\n"
+                    "       [--alsa-device DEV] [--alsa-capture-device DEV] [--alsa-playback-device DEV]\n",
                     argv[i], argv[0]);
             return 1;
         } else if (!server_ip) {
@@ -805,7 +848,8 @@ int main(int argc, char **argv) {
     if (!server_ip) {
         fprintf(stderr,
                 "usage: %s <server-ip> [--txid NAME] [--rx-only|--no-ptt] [--encrypt] [--key PASSWORD]\n"
-                "       [--codec-ptt] [--rpi-audio] [--alsa-device DEV] [--alsa-capture-device DEV] [--alsa-playback-device DEV]\n",
+                "       [--codec-ptt] [--altgr-ptt-delay-ms MS] [--rpi-audio]\n"
+                "       [--alsa-device DEV] [--alsa-capture-device DEV] [--alsa-playback-device DEV]\n",
                 argv[0]);
         return 1;
     }
@@ -870,6 +914,9 @@ int main(int argc, char **argv) {
         printf("encryption: disabled\n");
     }
     printf("ptt input: %s\n", g_app.codec_ptt_enabled ? "codec-ptt (KEY_ENTER)" : "keyboard Right Alt / AltGr");
+    if (!g_app.codec_ptt_enabled) {
+        printf("altgr ptt delay: %d ms\n", g_app.pc_ptt_hold_ms);
+    }
     if (g_app.alsa_capture_device[0]) {
         printf("capture: alsasrc device=\"%s\"\n", g_app.alsa_capture_device);
     } else {
