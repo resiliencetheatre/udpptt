@@ -3,9 +3,13 @@ CFLAGS ?= -O2 -Wall -Wextra -pthread
 
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
+DATADIR ?= /opt/udpptt
 
-USER_SYSTEMD_DIR ?= $(HOME)/.config/systemd/user
-USER_CONFIG_DIR ?= $(HOME)/.config/udpptt
+REAL_USER := $(if $(SUDO_USER),$(SUDO_USER),$(USER))
+REAL_HOME := $(if $(SUDO_USER),$(shell getent passwd $(SUDO_USER) | cut -d: -f6),$(HOME))
+
+USER_SYSTEMD_DIR ?= $(REAL_HOME)/.config/systemd/user
+USER_CONFIG_DIR ?= $(REAL_HOME)/.config/udpptt
 SERVICE_NAME ?= udpptt.service
 ENV_NAME ?= udpptt.env
 
@@ -18,6 +22,7 @@ CLIENT_CFLAGS := $(GST_CFLAGS) $(SODIUM_CFLAGS)
 CLIENT_LIBS   := $(GST_LIBS) $(SODIUM_LIBS)
 
 TARGETS = ptt_client ptt_server
+DATAFILES = start.wav stop.wav
 
 all: $(TARGETS)
 
@@ -32,6 +37,13 @@ install: all
 	install -m 0755 ptt_client "$(DESTDIR)$(BINDIR)/ptt_client"
 	install -m 0755 ptt_server "$(DESTDIR)$(BINDIR)/ptt_server"
 
+	mkdir -p "$(DESTDIR)$(DATADIR)"
+	for f in $(DATAFILES); do \
+		if [ -f "$$f" ]; then \
+			install -m 0644 "$$f" "$(DESTDIR)$(DATADIR)/$$f"; \
+		fi; \
+	done
+
 	mkdir -p "$(USER_SYSTEMD_DIR)"
 	mkdir -p "$(USER_CONFIG_DIR)"
 
@@ -43,6 +55,7 @@ install: all
 '' \
 '[Service]' \
 'Type=simple' \
+'WorkingDirectory=$(DATADIR)' \
 'EnvironmentFile=%h/.config/udpptt/udpptt.env' \
 'ExecStart=$(BINDIR)/ptt_client $${SERVER_IP} --altgr-ptt-delay-ms $${ALTGR_PTT_DELAY_MS} --txid $${CALL_SIGN} --encrypt --key $${WORD_OF_DAY}' \
 'Restart=always' \
@@ -61,24 +74,32 @@ install: all
 > "$(USER_CONFIG_DIR)/$(ENV_NAME)"; \
 	fi
 
+	if [ -n "$(SUDO_USER)" ]; then \
+		chown -R "$(REAL_USER):$(REAL_USER)" "$(REAL_HOME)/.config/systemd" "$(REAL_HOME)/.config/udpptt"; \
+	fi
+
 	@echo
 	@echo "Installed binaries to: $(DESTDIR)$(BINDIR)"
+	@echo "Installed tone files to: $(DESTDIR)$(DATADIR)"
 	@echo "Installed user service to: $(USER_SYSTEMD_DIR)/$(SERVICE_NAME)"
 	@echo "Installed env file to: $(USER_CONFIG_DIR)/$(ENV_NAME)"
+	@echo "Target user: $(REAL_USER)"
 	@echo
-	@echo "Then run:"
+	@echo "Then run as that user:"
 	@echo "  systemctl --user daemon-reload"
 	@echo "  systemctl --user enable --now $(SERVICE_NAME)"
 	@echo
-	@echo "If keyboard PTT is used, make sure your user can read /dev/input/event*."
-	@echo "Usually this means adding the user to the input group:"
-	@echo "  sudo usermod -aG input $$USER"
+	@echo "If keyboard PTT is used, make sure that user can read /dev/input/event*:"
+	@echo "  sudo usermod -aG input $(REAL_USER)"
 
 uninstall:
 	rm -f "$(DESTDIR)$(BINDIR)/ptt_client"
 	rm -f "$(DESTDIR)$(BINDIR)/ptt_server"
+	rm -f "$(DESTDIR)$(DATADIR)/start.wav"
+	rm -f "$(DESTDIR)$(DATADIR)/stop.wav"
+	rmdir "$(DESTDIR)$(DATADIR)" 2>/dev/null || true
 	rm -f "$(USER_SYSTEMD_DIR)/$(SERVICE_NAME)"
-	@echo "Removed binaries and user service."
+	@echo "Removed binaries, tone files, and user service."
 	@echo "Env file left in place: $(USER_CONFIG_DIR)/$(ENV_NAME)"
 
 clean:
