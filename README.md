@@ -278,6 +278,115 @@ On Debian, a common approach is to add that user to the input group:
 sudo usermod -aG input $USER
 ```
 
+## TPM2-backed secret with systemd-creds (work in progress)
+
+`udpptt` can use a TPM2-backed encrypted systemd credential instead of storing `WORD_OF_DAY` in plaintext inside the normal user env file. In this model, the secret is first encrypted into a `.cred` blob with `systemd-creds`, bound to the local TPM2, and then the user service loads it at runtime with `LoadCredentialEncrypted=`. The encrypted blob may be stored on disk, but decryption requires the original TPM2-capable machine. `systemd-analyze has-tpm2` can be used to verify that firmware, kernel driver, and userspace systemd TPM2 support are all available.
+
+### 1. Enroll the secret to TPM2
+
+First verify TPM2 support:
+
+```sh
+systemd-analyze has-tpm2
+```
+
+If keyboard PTT is also used, make sure the user can read `/dev/input/event*` as described elsewhere in this README. For TPM2-backed credentials, the user service also needs access to `/dev/tpmrm0`. On many Debian systems that means adding the user to the `tss` group and then logging out and back in so the new group membership takes effect:
+
+```sh
+sudo usermod -aG tss USERNAME
+```
+
+Create a temporary plaintext file, encrypt it into a TPM2-bound credential blob, then remove the plaintext source:
+
+```sh
+mkdir -p ~/.config/udpptt
+printf '%s\n' 'shared-room-secret' > ~/.config/udpptt/word_of_day.txt
+chmod 600 ~/.config/udpptt/word_of_day.txt
+
+sudo systemd-creds --name=word_of_day encrypt --with-key=tpm2 \
+  ~/.config/udpptt/word_of_day.txt \
+  ~/.config/udpptt/word_of_day.cred
+
+sudo chown USERNAME:USERNAME ~/.config/udpptt/word_of_day.cred
+chmod 600 ~/.config/udpptt/word_of_day.cred
+shred -u ~/.config/udpptt/word_of_day.txt
+```
+
+### 2. Manually check that the credential works
+
+You can manually decrypt the blob to confirm its content:
+
+```sh
+sudo systemd-creds --name=word_of_day decrypt \
+  ~/.config/udpptt/word_of_day.cred -
+```
+
+You can also confirm TPM2 support and inspect whether the TPM device is accessible:
+
+```sh
+systemd-analyze has-tpm2
+ls -l /dev/tpmrm0
+id
+```
+
+### 3. Example `udpptt.service` using TPM2-backed systemd credentials
+
+Store non-secret configuration in the normal env file, for example:
+
+`~/.config/udpptt/udpptt.env`
+
+```sh
+SERVER_IP=198.51.100.10
+CALL_SIGN=Alpha
+ALTGR_PTT_DELAY_MS=2000
+```
+
+Then use a user service like this:
+
+`~/.config/systemd/user/udpptt.service`
+
+```ini
+[Unit]
+Description=udpptt client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/udpptt
+EnvironmentFile=%h/.config/udpptt/udpptt.env
+LoadCredentialEncrypted=word_of_day:%h/.config/udpptt/word_of_day.cred
+ExecStart=/bin/sh -c 'exec /usr/local/bin/ptt_client "${SERVER_IP}" --altgr-ptt-delay-ms "${ALTGR_PTT_DELAY_MS}" --txid "${CALL_SIGN}" --encrypt --key "$(cat "${CREDENTIALS_DIRECTORY}/word_of_day")"'
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+```
+
+Enable the service with:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now udpptt.service
+```
+
+### 4. Erasing or removing the secret later
+
+If you simply want to stop using the TPM2-backed secret for `udpptt`, remove the encrypted credential file and reload or stop the service:
+
+```sh
+rm -f ~/.config/udpptt/word_of_day.cred
+systemctl --user daemon-reload
+systemctl --user restart udpptt.service
+```
+
+If you want to completely clear the TPM itself, that is a much more destructive operation. `tpm2_clear` resets TPM hierarchy authorization values and clears TPM state; this affects TPM-wide data, not just `udpptt`. Use it only if you understand the consequences for all TPM-backed features on the machine:
+
+```sh
+sudo tpm2_clear
+```
+
 
 License
 =======
