@@ -14,7 +14,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define SERVER_PORT 5000
+#define DEFAULT_SERVER_PORT 5000
 #define MAX_PACKET 2048
 #define MAX_CLIENTS 128
 #define PKT_IDLE 0
@@ -55,6 +55,20 @@ static long long now_ms(void) {
 static void on_sigint(int sig) {
     (void)sig;
     g_running = 0;
+}
+
+static int parse_udp_port(const char *s) {
+    char *endp = NULL;
+    long v;
+    if (!s || !s[0]) {
+        return -1;
+    }
+    errno = 0;
+    v = strtol(s, &endp, 10);
+    if (errno != 0 || !endp || *endp != '\0' || v < 1 || v > 65535) {
+        return -1;
+    }
+    return (int)v;
 }
 
 static void addr_to_text(const struct sockaddr_in *addr, char *out, size_t out_sz) {
@@ -137,7 +151,21 @@ static void maybe_release_active_talker(client_t *clients, int *active_talker) {
     }
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    int server_port = DEFAULT_SERVER_PORT;
+
+    if (argc == 3 && (strcmp(argv[1], "--port") == 0 || strcmp(argv[1], "--udp-port") == 0)) {
+        int p = parse_udp_port(argv[2]);
+        if (p < 0) {
+            fprintf(stderr, "invalid UDP port: %s\n", argv[2]);
+            return 1;
+        }
+        server_port = p;
+    } else if (argc != 1) {
+        fprintf(stderr, "usage: %s [--port PORT]\n", argv[0]);
+        return 1;
+    }
+
     signal(SIGINT, on_sigint);
     signal(SIGTERM, on_sigint);
 
@@ -163,7 +191,7 @@ int main(void) {
     memset(&srv, 0, sizeof(srv));
     srv.sin_family = AF_INET;
     srv.sin_addr.s_addr = htonl(INADDR_ANY);
-    srv.sin_port = htons(SERVER_PORT);
+    srv.sin_port = htons((uint16_t)server_port);
 
     if (bind(sock, (struct sockaddr *)&srv, sizeof(srv)) < 0) {
         perror("bind");
@@ -178,7 +206,7 @@ int main(void) {
     unsigned long total_rx_audio = 0;
     unsigned long total_forwarded = 0;
 
-    printf("ptt_server listening on UDP port %d\n", SERVER_PORT);
+    printf("ptt_server listening on UDP port %d\n", server_port);
     printf("protocol: type=0 idle, type=1 opus audio, cleartext talk_id, optional encrypted payload\n");
     printf("policy: first client sending audio gets talker slot until %d ms of silence\n", TALKER_HOLD_MS);
     fflush(stdout);

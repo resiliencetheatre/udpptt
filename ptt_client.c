@@ -24,7 +24,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define SERVER_PORT 5000
+#define DEFAULT_SERVER_PORT 5000
 #define LOCAL_PORT 0
 #define MAX_PACKET 2048
 #define PKT_IDLE 0
@@ -52,6 +52,7 @@ typedef struct {
 
 typedef struct {
     int sock;
+    int server_port;
     struct sockaddr_in server_addr;
     atomic_int running;
     atomic_int ptt_pressed;
@@ -149,6 +150,19 @@ static void copy_opt_string(char *dst, size_t dst_sz, const char *src) {
     snprintf(dst, dst_sz, "%s", src);
 }
 
+static int parse_udp_port(const char *s) {
+    char *endp = NULL;
+    long v;
+    if (!s || !s[0]) {
+        return -1;
+    }
+    errno = 0;
+    v = strtol(s, &endp, 10);
+    if (errno != 0 || !endp || *endp != '\0' || v < 1 || v > 65535) {
+        return -1;
+    }
+    return (int)v;
+}
 
 static int derive_key_from_password(const char *password, unsigned char out_key[KEY_LEN]) {
     if (!password || !password[0]) {
@@ -168,7 +182,7 @@ static int derive_key_from_password(const char *password, unsigned char out_key[
     return 0;
 }
 
-static int make_udp_socket(const char *server_ip, struct sockaddr_in *out_addr) {
+static int make_udp_socket(const char *server_ip, int server_port, struct sockaddr_in *out_addr) {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) {
         perror("socket");
@@ -189,7 +203,7 @@ static int make_udp_socket(const char *server_ip, struct sockaddr_in *out_addr) 
 
     memset(out_addr, 0, sizeof(*out_addr));
     out_addr->sin_family = AF_INET;
-    out_addr->sin_port = htons(SERVER_PORT);
+    out_addr->sin_port = htons((uint16_t)server_port);
     if (inet_pton(AF_INET, server_ip, &out_addr->sin_addr) != 1) {
         fprintf(stderr, "invalid server ip: %s\n", server_ip);
         close(fd);
@@ -769,6 +783,7 @@ static void cleanup(app_t *app) {
 int main(int argc, char **argv) {
     memset(&g_app, 0, sizeof(g_app));
     g_app.sock = -1;
+    g_app.server_port = DEFAULT_SERVER_PORT;
     g_app.ptt_enabled = 1;
     g_app.pc_ptt_hold_ms = 2000;
     snprintf(g_app.txid, sizeof(g_app.txid), "anon");
@@ -783,6 +798,18 @@ int main(int argc, char **argv) {
             g_app.encrypt_enabled = 1;
         } else if (strcmp(argv[i], "--codec-ptt") == 0) {
             g_app.codec_ptt_enabled = 1;
+        } else if (strcmp(argv[i], "--port") == 0 || strcmp(argv[i], "--udp-port") == 0) {
+            int p;
+            if (i + 1 >= argc) {
+                fprintf(stderr, "missing value for %s\n", argv[i]);
+                return 1;
+            }
+            p = parse_udp_port(argv[++i]);
+            if (p < 0) {
+                fprintf(stderr, "invalid UDP port: %s\n", argv[i]);
+                return 1;
+            }
+            g_app.server_port = p;
         } else if (strcmp(argv[i], "--altgr-ptt-delay-ms") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "missing value for --altgr-ptt-delay-ms\n");
@@ -832,7 +859,7 @@ int main(int argc, char **argv) {
         } else if (argv[i][0] == '-') {
             fprintf(stderr,
                     "unknown option: %s\n"
-                    "usage: %s <server-ip> [--txid NAME] [--rx-only|--no-ptt] [--encrypt] [--key PASSWORD]\n"
+                    "usage: %s <server-ip> [--port PORT] [--txid NAME] [--rx-only|--no-ptt] [--encrypt] [--key PASSWORD]\n"
                     "       [--codec-ptt] [--altgr-ptt-delay-ms MS] [--rpi-audio]\n"
                     "       [--alsa-device DEV] [--alsa-capture-device DEV] [--alsa-playback-device DEV]\n",
                     argv[i], argv[0]);
@@ -847,7 +874,7 @@ int main(int argc, char **argv) {
 
     if (!server_ip) {
         fprintf(stderr,
-                "usage: %s <server-ip> [--txid NAME] [--rx-only|--no-ptt] [--encrypt] [--key PASSWORD]\n"
+                "usage: %s <server-ip> [--port PORT] [--txid NAME] [--rx-only|--no-ptt] [--encrypt] [--key PASSWORD]\n"
                 "       [--codec-ptt] [--altgr-ptt-delay-ms MS] [--rpi-audio]\n"
                 "       [--alsa-device DEV] [--alsa-capture-device DEV] [--alsa-playback-device DEV]\n",
                 argv[0]);
@@ -877,7 +904,7 @@ int main(int argc, char **argv) {
 
     gst_init(&argc, &argv);
 
-    g_app.sock = make_udp_socket(server_ip, &g_app.server_addr);
+    g_app.sock = make_udp_socket(server_ip, g_app.server_port, &g_app.server_addr);
     if (g_app.sock < 0) {
         return 1;
     }
@@ -902,7 +929,7 @@ int main(int argc, char **argv) {
     atomic_store(&g_app.ptt_pressed, 0);
     atomic_store(&g_app.suppress_playback, 0);
 
-    printf("connected to %s:%d\n", server_ip, SERVER_PORT);
+    printf("connected to %s:%d\n", server_ip, g_app.server_port);
     printf("txid: %s\n", g_app.txid);
     printf("debug: shows PTT state, transmitted mic packets, received audio packets, and playback events\n");
     if (!g_app.ptt_enabled) {
