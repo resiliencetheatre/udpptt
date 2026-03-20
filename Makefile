@@ -21,7 +21,7 @@ SODIUM_LIBS   := $(shell pkg-config --libs libsodium 2>/dev/null)
 CLIENT_CFLAGS := $(GST_CFLAGS) $(SODIUM_CFLAGS)
 CLIENT_LIBS   := $(GST_LIBS) $(SODIUM_LIBS)
 
-TARGETS = ptt_client ptt_server
+TARGETS = ptt_client ptt_server ptt_helper
 DATAFILES = start.wav stop.wav
 
 all: $(TARGETS)
@@ -32,10 +32,14 @@ ptt_client: ptt_client.c
 ptt_server: ptt_server.c
 	$(CC) $(CFLAGS) -o $@ $<
 
+ptt_helper: ptt_helper.c
+	$(CC) $(CFLAGS) -o $@ $<
+
 install: all
 	mkdir -p "$(DESTDIR)$(BINDIR)"
 	install -m 0755 ptt_client "$(DESTDIR)$(BINDIR)/ptt_client"
 	install -m 0755 ptt_server "$(DESTDIR)$(BINDIR)/ptt_server"
+	install -m 0755 ptt_helper "$(DESTDIR)$(BINDIR)/ptt_helper"
 
 	mkdir -p "$(DESTDIR)$(DATADIR)"
 	for f in $(DATAFILES); do \
@@ -95,6 +99,7 @@ install: all
 uninstall:
 	rm -f "$(DESTDIR)$(BINDIR)/ptt_client"
 	rm -f "$(DESTDIR)$(BINDIR)/ptt_server"
+	rm -f "$(DESTDIR)$(BINDIR)/ptt_helper"
 	rm -f "$(DESTDIR)$(DATADIR)/start.wav"
 	rm -f "$(DESTDIR)$(DATADIR)/stop.wav"
 	rmdir "$(DESTDIR)$(DATADIR)" 2>/dev/null || true
