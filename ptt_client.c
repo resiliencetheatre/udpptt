@@ -77,6 +77,8 @@ typedef struct {
     int ptt_socket_enabled;
     char ptt_socket_path[PATH_MAX];
     transport_mode_t transport_mode;
+    int blackfiber_rx_passive;
+    int blackfiber_tx_only;
     struct sockaddr_in server_addr;
     char bf_ifname[IFNAMSIZ];
     uint16_t bf_ethertype;
@@ -489,7 +491,8 @@ static void usage(const char *argv0) {
             "usage: %s <server-ip> [--port PORT] [--txid NAME] [--rx-only|--no-ptt] [--encrypt] [--key PASSWORD]\n"
             "       [--codec-ptt] [--ptt-socket PATH] [--altgr-ptt-delay-ms MS] [--rpi-audio]\n"
             "       [--alsa-device DEV] [--alsa-capture-device DEV] [--alsa-playback-device DEV]\n"
-            "       [--blackfiber IFACE] [--bf-dst-mac MAC] [--bf-ethertype ETHERTYPE]\n", argv0);
+            "       [--blackfiber IFACE] [--bf-dst-mac MAC] [--bf-ethertype ETHERTYPE]\n"
+            "       [--blackfiber-rx-passive] [--blackfiber-tx-only]\n", argv0);
 }
 
 int main(int argc, char **argv) {
@@ -501,6 +504,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--codec-ptt")) g_app.codec_ptt_enabled = 1;
         else if (!strcmp(argv[i], "--ptt-socket") || !strcmp(argv[i], "--control-socket")) { if (i + 1 >= argc) { fprintf(stderr, "missing value for %s\n", argv[i]); return 1; } copy_opt_string(g_app.ptt_socket_path, sizeof(g_app.ptt_socket_path), argv[++i]); g_app.ptt_socket_enabled = 1; }
         else if (!strcmp(argv[i], "--blackfiber")) { if (i + 1 >= argc) { fprintf(stderr, "missing value for --blackfiber\n"); return 1; } g_app.transport_mode = TRANSPORT_BLACKFIBER; copy_opt_string(g_app.bf_ifname, sizeof(g_app.bf_ifname), argv[++i]); }
+        else if (!strcmp(argv[i], "--blackfiber-rx-passive")) { g_app.blackfiber_rx_passive = 1; }
+        else if (!strcmp(argv[i], "--blackfiber-tx-only")) { g_app.blackfiber_tx_only = 1; }
         else if (!strcmp(argv[i], "--bf-dst-mac")) { if (i + 1 >= argc) { fprintf(stderr, "missing value for --bf-dst-mac\n"); return 1; } if (parse_mac_address(argv[++i], g_app.bf_dst_mac) != 0) { fprintf(stderr, "invalid MAC address: %s\n", argv[i]); return 1; } }
         else if (!strcmp(argv[i], "--bf-ethertype")) { if (i + 1 >= argc) { fprintf(stderr, "missing value for --bf-ethertype\n"); return 1; } if (parse_ethertype(argv[++i], &g_app.bf_ethertype) != 0) { fprintf(stderr, "invalid ethertype: %s\n", argv[i]); return 1; } }
         else if (!strcmp(argv[i], "--port") || !strcmp(argv[i], "--udp-port")) { int p; if (i + 1 >= argc) { fprintf(stderr, "missing value for %s\n", argv[i]); return 1; } p = parse_udp_port(argv[++i]); if (p < 0) { fprintf(stderr, "invalid UDP port: %s\n", argv[i]); return 1; } g_app.server_port = p; }
@@ -520,6 +525,13 @@ int main(int argc, char **argv) {
         if (!server_ip) { usage(argv[0]); return 1; }
     } else {
         if (!g_app.bf_ifname[0]) { fprintf(stderr, "--blackfiber requires interface name\n"); return 1; }
+        if (g_app.blackfiber_rx_passive && g_app.blackfiber_tx_only) {
+            fprintf(stderr, "--blackfiber-rx-passive and --blackfiber-tx-only cannot be used together\n");
+            return 1;
+        }
+        if (g_app.blackfiber_rx_passive) {
+            g_app.ptt_enabled = 0;
+        }
     }
 
     if (g_app.ptt_socket_enabled && !g_app.ptt_socket_path[0]) { fprintf(stderr, "--ptt-socket requires a non-empty path\n"); return 1; }
@@ -547,6 +559,12 @@ int main(int argc, char **argv) {
         format_mac(mac_local, sizeof(mac_local), g_app.bf_local_mac);
         format_mac(mac_dst, sizeof(mac_dst), g_app.bf_dst_mac);
         printf("blackfiber: iface=%s ethertype=0x%04x local-mac=%s dst-mac=%s\n", g_app.bf_ifname, g_app.bf_ethertype, mac_local, mac_dst);
+        if (g_app.blackfiber_rx_passive) {
+            printf("blackfiber mode: rx-passive (no transmitted idle/audio frames)\n");
+        }
+        if (g_app.blackfiber_tx_only) {
+            printf("blackfiber mode: tx-only (receive thread disabled)\n");
+        }
     }
 
     printf("txid: %s\n", g_app.txid); printf("debug: shows PTT state, transmitted mic packets, received audio packets, and playback events\n");
@@ -557,8 +575,20 @@ int main(int argc, char **argv) {
     if (g_app.alsa_playback_device[0]) printf("playback: alsasink device=\"%s\"\n", g_app.alsa_playback_device); else printf("playback: autoaudiosink\n"); fflush(stdout);
     if (g_app.ptt_enabled) { if (pthread_create(&g_app.key_thread, NULL, keyboard_thread_main, &g_app) != 0) { perror("pthread_create(key_thread)"); cleanup(&g_app); return 1; } }
     if (g_app.ptt_socket_enabled) { if (pthread_create(&g_app.ctrl_thread, NULL, ptt_control_thread_main, &g_app) != 0) { perror("pthread_create(ctrl_thread)"); cleanup(&g_app); return 1; } }
-    if (pthread_create(&g_app.send_thread, NULL, send_thread_main, &g_app) != 0) { perror("pthread_create(send_thread)"); cleanup(&g_app); return 1; }
-    if (pthread_create(&g_app.recv_thread, NULL, recv_thread_main, &g_app) != 0) { perror("pthread_create(recv_thread)"); cleanup(&g_app); return 1; }
+    if (!(g_app.transport_mode == TRANSPORT_BLACKFIBER && g_app.blackfiber_rx_passive)) {
+        if (pthread_create(&g_app.send_thread, NULL, send_thread_main, &g_app) != 0) {
+            perror("pthread_create(send_thread)");
+            cleanup(&g_app);
+            return 1;
+        }
+    }
+    if (!(g_app.transport_mode == TRANSPORT_BLACKFIBER && g_app.blackfiber_tx_only)) {
+        if (pthread_create(&g_app.recv_thread, NULL, recv_thread_main, &g_app) != 0) {
+            perror("pthread_create(recv_thread)");
+            cleanup(&g_app);
+            return 1;
+        }
+    }
     while (atomic_load(&g_app.running)) msleep_int(100);
     cleanup(&g_app); return 0;
 }
