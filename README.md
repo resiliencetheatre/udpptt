@@ -4,6 +4,8 @@
 
 Simple UDP push-to-talk audio test program using a client/server model.
 
+`udpptt` can also be used in a raw Ethernet "black fiber" mode, where clients exchange audio frames directly over a local Ethernet interface without IP addressing, routing, DHCP, or a UDP server.
+
 
 ## UDP connection behavior
 
@@ -19,6 +21,60 @@ NAT port-forwarding rules, because the outbound UDP traffic keeps the
 return path alive for server-to-client audio delivery. This makes the 
 setup much simpler for roaming laptops, home networks, and small 
 embedded devices behind typical consumer routers or local firewalls.
+
+## Black fiber / raw Ethernet behavior
+
+In black fiber mode, `ptt_client` does not use IP or UDP. Instead, it opens a Linux raw packet socket on a selected Ethernet interface and sends the same internal `udpptt` packet format directly inside custom Ethernet frames.
+
+This mode is intended for simple point-to-point or isolated Layer-2 links, for example:
+
+- a direct Ethernet cable between two devices
+- a private switch with only `udpptt` devices attached
+- a media converter / black fiber path where no IP infrastructure is desired
+- test setups where DHCP, IP addressing, routing, NAT, and firewall rules should be avoided completely
+
+Black fiber mode is selected with:
+
+```sh
+./ptt_client --blackfiber <iface> --txid <callsign>
+```
+
+Example:
+
+```sh
+./ptt_client --blackfiber eth0 --txid Alpha --encrypt --key 'shared room secret'
+```
+
+By default, black fiber mode sends to the Ethernet broadcast MAC address:
+
+```text
+ff:ff:ff:ff:ff:ff
+```
+
+This is convenient for two-node or small isolated Layer-2 test links. You can also send to a specific destination MAC address:
+
+```sh
+./ptt_client --blackfiber eth0 \
+    --bf-dst-mac 02:11:22:33:44:55 \
+    --txid Alpha \
+    --encrypt --key 'shared room secret'
+```
+
+The default custom Ethernet type is:
+
+```text
+0x88B5
+```
+
+You can override it if needed:
+
+```sh
+./ptt_client --blackfiber eth0 --bf-ethertype 0x88B6 --txid Alpha
+```
+
+All clients on the same black fiber segment must use the same Ethernet type. If encryption is enabled, all participating clients must also use the same room password.
+
+Black fiber mode does not use `ptt_server`. It is direct client-to-client Layer-2 transport. The existing UDP/server mode remains unchanged and is still used when `--blackfiber` is not specified.
 
 Packages typically needed on Debian/Ubuntu:
 
@@ -40,7 +96,7 @@ sudo make install
 
 The install step does the following:
 
-- installs `ptt_client` and `ptt_server` to `/usr/local/bin`
+- installs `ptt_client`, `ptt_server`, and `ptt_helper` to `/usr/local/bin`
 - installs `start.wav` and `stop.wav` to `/opt/udpptt`
 - installs a user systemd service file to:
 
@@ -94,6 +150,12 @@ ALTGR_PTT_DELAY_MS=2000
 
 This file is intended to be edited by the user after installation. It defines the server address, callsign, encryption password, and AltGr PTT hold delay.
 
+For black fiber mode, the service command currently needs to be adjusted manually so that it uses `--blackfiber <iface>` instead of a server IP. For example:
+
+```ini
+ExecStart=/usr/local/bin/ptt_client --blackfiber eth0 --altgr-ptt-delay-ms ${ALTGR_PTT_DELAY_MS} --txid ${CALL_SIGN} --encrypt --key ${WORD_OF_DAY}
+```
+
 ## Manual installation steps and details
 
 Build:
@@ -108,7 +170,7 @@ Run server:
 ./ptt_server
 ```
 
-Run client:
+Run client in UDP/server mode:
 
 ```sh
 ./ptt_client <server-ip> [--txid <callsign>] [--rx-only]
@@ -122,6 +184,14 @@ UDPPTT_KEY='<password>' ./ptt_client <server-ip> [--txid <callsign>] [--encrypt]
 ./ptt_client <server-ip> [--rpi-audio]
 ./ptt_client <server-ip> [--alsa-device <device>]
 ./ptt_client <server-ip> [--alsa-capture-device <device>] [--alsa-playback-device <device>]
+```
+
+Run client in black fiber / raw Ethernet mode:
+
+```sh
+./ptt_client --blackfiber <iface> [--txid <callsign>]
+./ptt_client --blackfiber <iface> [--txid <callsign>] [--encrypt] [--key <password>]
+./ptt_client --blackfiber <iface> [--bf-dst-mac <mac>] [--bf-ethertype <ethertype>]
 ```
 
 Examples:
@@ -138,19 +208,27 @@ UDPPTT_KEY='shared room secret' ./ptt_client 198.51.100.10 --txid Bravo --rx-onl
 ./ptt_client 198.51.100.10 --txid Bravo --codec-ptt --rpi-audio --encrypt --key 'shared room secret'
 ./ptt_client 198.51.100.10 --txid Bravo --alsa-device plughw:0,0 --codec-ptt
 ./ptt_client 198.51.100.10 --txid Bravo --alsa-capture-device plughw:0,0 --alsa-playback-device plughw:0,0
+
+./ptt_client --blackfiber eth0 --txid Alpha --encrypt --key 'shared room secret'
+./ptt_client --blackfiber enp0s31f6 --txid Bravo --encrypt --key 'shared room secret'
+./ptt_client --blackfiber eth0 --bf-dst-mac 02:11:22:33:44:55 --txid Alpha --encrypt --key 'shared room secret'
+./ptt_client --blackfiber eth0 --bf-ethertype 0x88B6 --txid Alpha
 ```
 
 ## Notes
 
-- The client continuously sends UDP packets to the server from one local UDP socket.
+- In normal UDP mode, the client continuously sends UDP packets to the server from one local UDP socket.
+- In black fiber mode, the client sends raw Ethernet frames directly on the selected interface.
 - Each packet contains a packet type and cleartext `talk_id` header.
 - When encryption is enabled, the Opus payload is encrypted end-to-end between clients.
 - The `talk_id` remains visible for logging/debug, but is authenticated together with the packet.
-- The server does not encrypt or decrypt payloads; it only forwards packets.
+- The UDP server does not encrypt or decrypt payloads; it only forwards packets.
+- Black fiber mode does not use `ptt_server`; clients exchange frames directly at Layer 2.
 - Encrypted and unencrypted clients do not interoperate on the same channel.
 - All encrypted clients must use the same shared password.
 - The server listens on UDP/5000 and forwards only the active talker’s audio to other clients.
-- A sender never gets its own audio back from the server.
+- A sender never gets its own audio back from the UDP server.
+- In black fiber mode, locally transmitted raw frames may also be visible to the sender’s raw socket, so the client ignores frames whose source MAC address matches its own interface MAC.
 - While the local client is transmitting, it suppresses playback of received audio.
 - In receive mode, incoming audio debug messages show the `talk_id` of the sending party.
 - The `--rx-only` and `--no-ptt` options disable keyboard PTT handling and microphone capture, but still keep the client connected for receive/playback.
@@ -168,6 +246,12 @@ UDPPTT_KEY='shared room secret' ./ptt_client 198.51.100.10 --txid Bravo --rx-onl
 
 ```sh
 ./ptt_client <server-ip> --altgr-ptt-delay-ms 2000
+```
+
+Black fiber example:
+
+```sh
+./ptt_client --blackfiber eth0 --txid Alpha --altgr-ptt-delay-ms 2000
 ```
 
 ### Codec / embedded PTT mode
@@ -206,15 +290,142 @@ Examples:
 ./ptt_client 198.51.100.10 --rpi-audio --codec-ptt --txid Bravo
 ./ptt_client 198.51.100.10 --alsa-device plughw:0,0 --txid Bravo
 ./ptt_client 198.51.100.10 --alsa-capture-device plughw:1,0 --alsa-playback-device plughw:0,0
+
+./ptt_client --blackfiber eth0 --rpi-audio --codec-ptt --txid Bravo
+./ptt_client --blackfiber eth0 --alsa-device plughw:0,0 --txid Bravo
 ```
 
 This is useful on Buildroot and Raspberry Pi systems where automatic GStreamer audio sink/source selection may not work reliably.
+
+It is also useful when testing black fiber mode with capabilities. If you run the entire program with `sudo`, desktop audio backends such as PipeWire or PulseAudio may not be available to root. Prefer running as the normal user and granting only raw Ethernet permission to the binary with `setcap`.
 
 ## Permissions
 
 - The client scans readable `/dev/input/event*` devices for the selected PTT key.
 - Membership in the `input` group is usually enough.
 - On embedded targets using `--codec-ptt`, make sure the `ptt_keys` input device is accessible to the user running `ptt_client`.
+
+On Debian, a common approach is:
+
+```sh
+sudo usermod -aG input $USER
+```
+
+Log out and back in after changing group membership.
+
+### Raw Ethernet permissions for black fiber mode
+
+Black fiber mode uses Linux raw packet sockets (`AF_PACKET`). Opening this kind of socket normally requires root or the `CAP_NET_RAW` capability.
+
+Running the whole client with `sudo` is not recommended on desktop systems, because audio may stop working when the process runs as root. Typical symptoms include PipeWire or PulseAudio connection failures, or `autoaudiosrc` / `autoaudiosink` choosing the wrong backend.
+
+Instead, grant only the raw socket capability to the installed binary:
+
+```sh
+sudo setcap cap_net_raw+ep /usr/local/bin/ptt_client
+```
+
+Check that the capability was applied:
+
+```sh
+getcap /usr/local/bin/ptt_client
+```
+
+Expected output:
+
+```text
+/usr/local/bin/ptt_client cap_net_raw=ep
+```
+
+Then run `ptt_client` as the normal user:
+
+```sh
+/usr/local/bin/ptt_client --blackfiber eth0 --txid Alpha --encrypt --key 'shared room secret'
+```
+
+If the interface or system policy requires additional network administration capability, you can also grant:
+
+```sh
+sudo setcap cap_net_raw,cap_net_admin+ep /usr/local/bin/ptt_client
+```
+
+Use the narrower `cap_net_raw+ep` form first unless you know `cap_net_admin` is needed.
+
+If the binary is rebuilt or reinstalled, file capabilities may be lost and must be applied again:
+
+```sh
+sudo setcap cap_net_raw+ep /usr/local/bin/ptt_client
+```
+
+For Buildroot or embedded systems where `setcap` is not available, typical alternatives are:
+
+- run `ptt_client` as root and force explicit ALSA devices with `--alsa-device` or `--alsa-capture-device` / `--alsa-playback-device`
+- start the program from a service with only the needed capability if your init/systemd setup supports capability bounding
+- configure the image to install the binary with the desired file capability
+
+## Black fiber setup examples
+
+### Direct cable between two clients
+
+On client A:
+
+```sh
+./ptt_client --blackfiber eth0 --txid Alpha --encrypt --key 'shared room secret'
+```
+
+On client B:
+
+```sh
+./ptt_client --blackfiber eth0 --txid Bravo --encrypt --key 'shared room secret'
+```
+
+No IP address is needed on `eth0`.
+
+If the Ethernet interface is down, bring it up first:
+
+```sh
+sudo ip link set eth0 up
+```
+
+### Fixed MAC destination
+
+Broadcast is easiest, but a fixed destination MAC can be used:
+
+On client A, send to client B:
+
+```sh
+./ptt_client --blackfiber eth0 \
+    --bf-dst-mac 02:22:33:44:55:66 \
+    --txid Alpha \
+    --encrypt --key 'shared room secret'
+```
+
+On client B, send to client A:
+
+```sh
+./ptt_client --blackfiber eth0 \
+    --bf-dst-mac 02:aa:bb:cc:dd:ee \
+    --txid Bravo \
+    --encrypt --key 'shared room secret'
+```
+
+You can inspect interface MAC addresses with:
+
+```sh
+ip link show eth0
+```
+
+### Explicit ALSA with black fiber
+
+If audio backend selection is unreliable, specify ALSA devices explicitly:
+
+```sh
+./ptt_client --blackfiber eth0 \
+    --txid Alpha \
+    --encrypt --key 'shared room secret' \
+    --alsa-capture-device plughw:0,0 \
+    --alsa-playback-device plughw:0,0
+```
 
 ## systemd service
 
@@ -276,6 +487,42 @@ On Debian, a common approach is to add that user to the input group:
 
 ```
 sudo usermod -aG input $USER
+```
+
+### Example systemd user service for black fiber
+
+For black fiber mode, the service does not need a server IP. Example:
+
+```ini
+[Unit]
+Description=udpptt client blackfiber
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/udpptt
+EnvironmentFile=%h/.config/udpptt/udpptt.env
+ExecStart=/usr/local/bin/ptt_client --blackfiber ${BLACKFIBER_IFACE} --altgr-ptt-delay-ms ${ALTGR_PTT_DELAY_MS} --txid ${CALL_SIGN} --encrypt --key ${WORD_OF_DAY}
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+```
+
+Example env file:
+
+```sh
+BLACKFIBER_IFACE=eth0
+CALL_SIGN=Alpha
+WORD_OF_DAY=shared-room-secret
+ALTGR_PTT_DELAY_MS=2000
+```
+
+Before using a user service in black fiber mode, apply the raw socket capability:
+
+```sh
+sudo setcap cap_net_raw+ep /usr/local/bin/ptt_client
 ```
 
 ## TPM2-backed secret with systemd-creds (work in progress)
