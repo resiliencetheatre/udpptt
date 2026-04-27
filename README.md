@@ -24,6 +24,8 @@ embedded devices behind typical consumer routers or local firewalls.
 
 ## Black fiber / raw Ethernet behavior
 
+![blackfiber picture](img/blackfiber.png "blackfiber")
+
 In black fiber mode, `ptt_client` does not use IP or UDP. Instead, it opens a Linux raw packet socket on a selected Ethernet interface and sends the same internal `udpptt` packet format directly inside custom Ethernet frames.
 
 This mode is intended for simple point-to-point or isolated Layer-2 links, for example:
@@ -433,6 +435,8 @@ If audio backend selection is unreliable, specify ALSA devices explicitly:
 
 
 ## Data diode / one-way black fiber use
+
+![blackfiber datadiode picture](img/blackfiber-datadiode.png "blackfiber-datadiode")
 
 Black fiber mode can also be used across a one-way Ethernet data diode. In that design, audio is intentionally allowed to travel in only one direction.
 
