@@ -192,6 +192,8 @@ Run client in black fiber / raw Ethernet mode:
 ./ptt_client --blackfiber <iface> [--txid <callsign>]
 ./ptt_client --blackfiber <iface> [--txid <callsign>] [--encrypt] [--key <password>]
 ./ptt_client --blackfiber <iface> [--bf-dst-mac <mac>] [--bf-ethertype <ethertype>]
+./ptt_client --blackfiber <iface> [--blackfiber-tx-only]
+./ptt_client --blackfiber <iface> [--blackfiber-rx-passive]
 ```
 
 Examples:
@@ -224,6 +226,8 @@ UDPPTT_KEY='shared room secret' ./ptt_client 198.51.100.10 --txid Bravo --rx-onl
 - The `talk_id` remains visible for logging/debug, but is authenticated together with the packet.
 - The UDP server does not encrypt or decrypt payloads; it only forwards packets.
 - Black fiber mode does not use `ptt_server`; clients exchange frames directly at Layer 2.
+- `--blackfiber-tx-only` disables the receive thread for one-way transmit-side data diode use.
+- `--blackfiber-rx-passive` disables the send thread and microphone capture for one-way passive receive-side data diode use.
 - Encrypted and unencrypted clients do not interoperate on the same channel.
 - All encrypted clients must use the same shared password.
 - The server listens on UDP/5000 and forwards only the active talker’s audio to other clients.
@@ -426,6 +430,109 @@ If audio backend selection is unreliable, specify ALSA devices explicitly:
     --alsa-capture-device plughw:0,0 \
     --alsa-playback-device plughw:0,0
 ```
+
+
+## Data diode / one-way black fiber use
+
+Black fiber mode can also be used across a one-way Ethernet data diode. In that design, audio is intentionally allowed to travel in only one direction.
+
+This is useful when the physical link policy is:
+
+```text
+TX side microphone/audio source  --->  data diode  --->  RX side speaker/audio receiver
+```
+
+In this mode there is no return path. That means:
+
+- there is no receiver acknowledgement
+- there is no return audio
+- there is no bidirectional PTT conversation
+- there is no feedback that the receiver heard the audio
+- packet loss cannot be repaired by retransmission
+
+For live voice, this is often acceptable if the one-way Layer-2 path is clean and packet loss is low.
+
+### Transmit side
+
+On the transmit side of the diode, use:
+
+```sh
+--blackfiber-tx-only
+```
+
+This starts the normal transmit path but disables the receive thread. The client will send idle frames and audio frames, but it will not listen for incoming black fiber frames.
+
+Example TX side:
+
+```sh
+./ptt_client --blackfiber eth0 \
+    --blackfiber-tx-only \
+    --txid TX \
+    --encrypt --key 'shared room secret' \
+    --alsa-capture-device plughw:0,0
+```
+
+If the transmit side also needs local playback for tones, add playback device selection too:
+
+```sh
+./ptt_client --blackfiber eth0 \
+    --blackfiber-tx-only \
+    --txid TX \
+    --encrypt --key 'shared room secret' \
+    --alsa-capture-device plughw:0,0 \
+    --alsa-playback-device plughw:0,0
+```
+
+### Receive side
+
+On the receive side of the diode, use:
+
+```sh
+--blackfiber-rx-passive
+```
+
+This makes the receive-side client passive:
+
+- it does not start microphone capture
+- it does not send idle frames
+- it does not send audio frames
+- it only receives, decrypts, decodes, and plays audio
+
+Example RX side:
+
+```sh
+./ptt_client --blackfiber eth0 \
+    --blackfiber-rx-passive \
+    --txid RX \
+    --encrypt --key 'shared room secret' \
+    --alsa-playback-device plughw:0,0
+```
+
+The receive side still needs the same encryption password as the transmit side.
+
+### Data diode permission notes
+
+Both sides still use raw Ethernet sockets in black fiber mode. If running on a normal Linux desktop, prefer file capabilities over `sudo` so audio continues to run in the normal user session:
+
+```sh
+sudo setcap cap_net_raw+ep /usr/local/bin/ptt_client
+```
+
+Then run the client as the normal user.
+
+If you run the whole program with `sudo`, raw Ethernet will work, but desktop audio may fail because root may not have access to the user's PipeWire or PulseAudio session. On embedded systems without PipeWire/PulseAudio, this is less of a problem, but explicit ALSA device selection is still recommended.
+
+### Data diode security notes
+
+The data diode enforces traffic direction. It does not encrypt traffic by itself. If confidentiality is needed, continue to use:
+
+```sh
+--encrypt --key 'shared room secret'
+```
+
+The current encryption protects the Opus audio payload with XChaCha20-Poly1305. The `talk_id` remains visible for logging/debug, but is authenticated as additional authenticated data.
+
+The current shared-password design does not provide perfect forward secrecy. If the shared password is later compromised, previously recorded encrypted black fiber frames may also be decrypted.
 
 ## systemd service
 
