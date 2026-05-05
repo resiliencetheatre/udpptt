@@ -1,0 +1,7 @@
+{
+  "uuid": "udpptt-indicator@resiliencetheatre.codeberg.org",
+  "name": "udpptt PTT Indicator",
+  "description": "Shows udpptt push-to-talk state in the GNOME top panel.",
+  "shell-version": ["48"],
+  "url": "https://codeberg.org/resiliencetheatre/udpptt"
+}

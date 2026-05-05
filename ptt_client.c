@@ -76,6 +76,8 @@ typedef struct {
     int ptt_ctrl_sock;
     int ptt_socket_enabled;
     char ptt_socket_path[PATH_MAX];
+    int state_file_enabled;
+    char state_file_path[PATH_MAX];
     transport_mode_t transport_mode;
     int blackfiber_rx_passive;
     int blackfiber_tx_only;
@@ -153,6 +155,78 @@ static int parse_mac_address(const char *s, uint8_t out[ETH_ALEN]) {
 static void format_mac(char *dst, size_t dst_sz, const uint8_t mac[ETH_ALEN]) {
     if (!dst || dst_sz == 0 || !mac) return;
     snprintf(dst, dst_sz, "%02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+static int mkdir_parent_dir_for_file(const char *path) {
+    char tmp[PATH_MAX];
+    char *slash;
+
+    if (!path || !path[0]) return -1;
+    if (strlen(path) >= sizeof(tmp)) return -1;
+
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    slash = strrchr(tmp, '/');
+    if (!slash) return 0;
+    if (slash == tmp) return 0;
+    *slash = '\0';
+
+    for (char *p = tmp + 1; *p; ++p) {
+        if (*p == '/') {
+            *p = '\0';
+            if (mkdir(tmp, 0700) < 0 && errno != EEXIST) return -1;
+            *p = '/';
+        }
+    }
+
+    if (mkdir(tmp, 0700) < 0 && errno != EEXIST) return -1;
+    return 0;
+}
+
+static void write_ptt_state_file(app_t *app, int pressed) {
+    char tmp_path[PATH_MAX];
+    char content[256];
+    int fd;
+    ssize_t n;
+
+    if (!app || !app->state_file_enabled || !app->state_file_path[0]) return;
+
+    if (mkdir_parent_dir_for_file(app->state_file_path) != 0) {
+        fprintf(stderr, "state-file: failed to create parent directory for %s: %s\n", app->state_file_path, strerror(errno));
+        return;
+    }
+
+    if (snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%ld", app->state_file_path, (long)getpid()) >= (int)sizeof(tmp_path)) {
+        fprintf(stderr, "state-file: temporary path too long for %s\n", app->state_file_path);
+        return;
+    }
+
+    n = snprintf(content, sizeof(content), "PTT %s txid=%s time_ms=%lld\n", pressed ? "DOWN" : "UP", app->txid, now_ms());
+    if (n < 0 || (size_t)n >= sizeof(content)) return;
+
+    fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        fprintf(stderr, "state-file: open %s failed: %s\n", tmp_path, strerror(errno));
+        return;
+    }
+
+    if (write(fd, content, (size_t)n) != n) {
+        fprintf(stderr, "state-file: write %s failed: %s\n", tmp_path, strerror(errno));
+        close(fd);
+        unlink(tmp_path);
+        return;
+    }
+
+    if (fsync(fd) < 0) {
+        fprintf(stderr, "state-file: fsync %s failed: %s\n", tmp_path, strerror(errno));
+    }
+
+    close(fd);
+
+    if (rename(tmp_path, app->state_file_path) < 0) {
+        fprintf(stderr, "state-file: rename %s -> %s failed: %s\n", tmp_path, app->state_file_path, strerror(errno));
+        unlink(tmp_path);
+        return;
+    }
 }
 
 static int derive_key_from_password(const char *password, unsigned char out_key[KEY_LEN]) {
@@ -321,6 +395,7 @@ static void set_ptt_state(app_t *app, int pressed) {
     int old = atomic_exchange(&app->ptt_pressed, pressed); atomic_store(&app->suppress_playback, pressed);
     if (old != pressed) {
         printf("[%lld] PTT %s (txid=%s)\n", now_ms(), pressed ? "DOWN -> sending microphone audio" : "UP -> sending idle frames", app->txid); fflush(stdout);
+        write_ptt_state_file(app, pressed);
         if (pressed) { if (app->have_start_wav) play_tone_async(app, app->start_wav_path); }
         else { if (app->have_stop_wav) play_tone_async(app, app->stop_wav_path); }
     }
@@ -473,6 +548,7 @@ static void *recv_thread_main(void *arg) {
 
 static void cleanup(app_t *app) {
     atomic_store(&app->running, 0);
+    if (app->state_file_enabled) write_ptt_state_file(app, 0);
     if (app->ptt_ctrl_sock >= 0) { close(app->ptt_ctrl_sock); app->ptt_ctrl_sock = -1; }
     if (app->key_thread) pthread_join(app->key_thread, NULL);
     if (app->ctrl_thread) pthread_join(app->ctrl_thread, NULL);
@@ -489,7 +565,7 @@ static void cleanup(app_t *app) {
 static void usage(const char *argv0) {
     fprintf(stderr,
             "usage: %s <server-ip> [--port PORT] [--txid NAME] [--rx-only|--no-ptt] [--encrypt] [--key PASSWORD]\n"
-            "       [--codec-ptt] [--ptt-socket PATH] [--altgr-ptt-delay-ms MS] [--rpi-audio]\n"
+            "       [--codec-ptt] [--ptt-socket PATH] [--state-file PATH] [--altgr-ptt-delay-ms MS] [--rpi-audio]\n"
             "       [--alsa-device DEV] [--alsa-capture-device DEV] [--alsa-playback-device DEV]\n"
             "       [--blackfiber IFACE] [--bf-dst-mac MAC] [--bf-ethertype ETHERTYPE]\n"
             "       [--blackfiber-rx-passive] [--blackfiber-tx-only]\n", argv0);
@@ -503,6 +579,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--encrypt")) g_app.encrypt_enabled = 1;
         else if (!strcmp(argv[i], "--codec-ptt")) g_app.codec_ptt_enabled = 1;
         else if (!strcmp(argv[i], "--ptt-socket") || !strcmp(argv[i], "--control-socket")) { if (i + 1 >= argc) { fprintf(stderr, "missing value for %s\n", argv[i]); return 1; } copy_opt_string(g_app.ptt_socket_path, sizeof(g_app.ptt_socket_path), argv[++i]); g_app.ptt_socket_enabled = 1; }
+        else if (!strcmp(argv[i], "--state-file") || !strcmp(argv[i], "--ptt-state-file")) { if (i + 1 >= argc) { fprintf(stderr, "missing value for %s\n", argv[i]); return 1; } copy_opt_string(g_app.state_file_path, sizeof(g_app.state_file_path), argv[++i]); g_app.state_file_enabled = 1; }
         else if (!strcmp(argv[i], "--blackfiber")) { if (i + 1 >= argc) { fprintf(stderr, "missing value for --blackfiber\n"); return 1; } g_app.transport_mode = TRANSPORT_BLACKFIBER; copy_opt_string(g_app.bf_ifname, sizeof(g_app.bf_ifname), argv[++i]); }
         else if (!strcmp(argv[i], "--blackfiber-rx-passive")) { g_app.blackfiber_rx_passive = 1; }
         else if (!strcmp(argv[i], "--blackfiber-tx-only")) { g_app.blackfiber_tx_only = 1; }
@@ -535,6 +612,7 @@ int main(int argc, char **argv) {
     }
 
     if (g_app.ptt_socket_enabled && !g_app.ptt_socket_path[0]) { fprintf(stderr, "--ptt-socket requires a non-empty path\n"); return 1; }
+    if (g_app.state_file_enabled && !g_app.state_file_path[0]) { fprintf(stderr, "--state-file requires a non-empty path\n"); return 1; }
     if (sodium_init() < 0) { fprintf(stderr, "libsodium init failed\n"); return 1; }
     if (g_app.encrypt_enabled) { if (!password || !password[0]) password = getenv("UDPPTT_KEY"); if (!password || !password[0]) { fprintf(stderr, "--encrypt requires --key PASSWORD or UDPPTT_KEY\n"); return 1; } if (derive_key_from_password(password, g_app.key) != 0) return 1; }
 
@@ -551,6 +629,7 @@ int main(int argc, char **argv) {
     g_app.playback_pipeline = make_playback_pipeline(&g_app.playback_src, g_app.alsa_playback_device); if (!g_app.playback_pipeline) { cleanup(&g_app); return 1; }
     init_ptt_tones(&g_app);
     atomic_store(&g_app.running, 1); atomic_store(&g_app.ptt_pressed, 0); atomic_store(&g_app.ptt_keyboard_pressed, 0); atomic_store(&g_app.ptt_socket_pressed, 0); atomic_store(&g_app.suppress_playback, 0);
+    if (g_app.state_file_enabled) write_ptt_state_file(&g_app, 0);
 
     if (g_app.transport_mode == TRANSPORT_UDP) {
         printf("connected to %s:%d\n", server_ip, g_app.server_port);
@@ -570,7 +649,7 @@ int main(int argc, char **argv) {
     printf("txid: %s\n", g_app.txid); printf("debug: shows PTT state, transmitted mic packets, received audio packets, and playback events\n");
     if (!g_app.ptt_enabled) printf("mode: receive-only (--rx-only), keyboard PTT disabled, microphone capture disabled\n");
     if (g_app.encrypt_enabled) printf("encryption: enabled (XChaCha20-Poly1305 payload encryption, cleartext authenticated talk_id)\n"); else printf("encryption: disabled\n");
-    printf("ptt input: %s\n", g_app.codec_ptt_enabled ? "codec-ptt (KEY_ENTER)" : "keyboard Right Alt / AltGr"); if (!g_app.codec_ptt_enabled) printf("altgr ptt delay: %d ms\n", g_app.pc_ptt_hold_ms); if (g_app.ptt_socket_enabled) printf("ptt socket: %s\n", g_app.ptt_socket_path);
+    printf("ptt input: %s\n", g_app.codec_ptt_enabled ? "codec-ptt (KEY_ENTER)" : "keyboard Right Alt / AltGr"); if (!g_app.codec_ptt_enabled) printf("altgr ptt delay: %d ms\n", g_app.pc_ptt_hold_ms); if (g_app.ptt_socket_enabled) printf("ptt socket: %s\n", g_app.ptt_socket_path); if (g_app.state_file_enabled) printf("ptt state file: %s\n", g_app.state_file_path);
     if (g_app.alsa_capture_device[0]) printf("capture: alsasrc device=\"%s\"\n", g_app.alsa_capture_device); else printf("capture: autoaudiosrc\n");
     if (g_app.alsa_playback_device[0]) printf("playback: alsasink device=\"%s\"\n", g_app.alsa_playback_device); else printf("playback: autoaudiosink\n"); fflush(stdout);
     if (g_app.ptt_enabled) { if (pthread_create(&g_app.key_thread, NULL, keyboard_thread_main, &g_app) != 0) { perror("pthread_create(key_thread)"); cleanup(&g_app); return 1; } }
