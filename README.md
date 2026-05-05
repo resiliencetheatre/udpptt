@@ -98,7 +98,7 @@ sudo make install
 
 The install step does the following:
 
-- installs `ptt_client`, `ptt_server`, and `ptt_helper` to `/usr/local/bin`
+- installs `ptt_client`, `ptt_server`, `ptt_helper`, and `ptt_hid` to `/usr/local/bin`
 - installs `start.wav` and `stop.wav` to `/opt/udpptt`
 - installs a user systemd service file to:
 
@@ -182,6 +182,7 @@ UDPPTT_KEY='<password>' ./ptt_client <server-ip> [--txid <callsign>] [--encrypt]
 
 ./ptt_client <server-ip> [--codec-ptt]
 ./ptt_client <server-ip> [--altgr-ptt-delay-ms <ms>]
+./ptt_client <server-ip> [--ptt-socket <path>]
 
 ./ptt_client <server-ip> [--rpi-audio]
 ./ptt_client <server-ip> [--alsa-device <device>]
@@ -196,6 +197,7 @@ Run client in black fiber / raw Ethernet mode:
 ./ptt_client --blackfiber <iface> [--bf-dst-mac <mac>] [--bf-ethertype <ethertype>]
 ./ptt_client --blackfiber <iface> [--blackfiber-tx-only]
 ./ptt_client --blackfiber <iface> [--blackfiber-rx-passive]
+./ptt_client --blackfiber <iface> [--ptt-socket <path>]
 ```
 
 Examples:
@@ -209,6 +211,8 @@ UDPPTT_KEY='shared room secret' ./ptt_client 198.51.100.10 --txid Bravo --rx-onl
 ./ptt_client 198.51.100.10 --txid Alpha --altgr-ptt-delay-ms 2000
 ./ptt_client 198.51.100.10 --txid Alpha --altgr-ptt-delay-ms 700 --encrypt --key 'shared room secret'
 
+./ptt_client 198.51.100.10 --txid Alpha --ptt-socket /tmp/udpptt.sock --encrypt --key 'shared room secret'
+
 ./ptt_client 198.51.100.10 --txid Bravo --codec-ptt --rpi-audio --encrypt --key 'shared room secret'
 ./ptt_client 198.51.100.10 --txid Bravo --alsa-device plughw:0,0 --codec-ptt
 ./ptt_client 198.51.100.10 --txid Bravo --alsa-capture-device plughw:0,0 --alsa-playback-device plughw:0,0
@@ -217,6 +221,7 @@ UDPPTT_KEY='shared room secret' ./ptt_client 198.51.100.10 --txid Bravo --rx-onl
 ./ptt_client --blackfiber enp0s31f6 --txid Bravo --encrypt --key 'shared room secret'
 ./ptt_client --blackfiber eth0 --bf-dst-mac 02:11:22:33:44:55 --txid Alpha --encrypt --key 'shared room secret'
 ./ptt_client --blackfiber eth0 --bf-ethertype 0x88B6 --txid Alpha
+./ptt_client --blackfiber eth0 --txid Alpha --ptt-socket /tmp/udpptt.sock --encrypt --key 'shared room secret'
 ```
 
 ## Notes
@@ -239,6 +244,7 @@ UDPPTT_KEY='shared room secret' ./ptt_client 198.51.100.10 --txid Bravo --rx-onl
 - In receive mode, incoming audio debug messages show the `talk_id` of the sending party.
 - The `--rx-only` and `--no-ptt` options disable keyboard PTT handling and microphone capture, but still keep the client connected for receive/playback.
 - The client can optionally play local `start.wav` and `stop.wav` tones on PTT press/release if those files exist in the current working directory.
+- The `--ptt-socket` option enables external PTT control through a UNIX datagram socket. This is used by `ptt_helper` and `ptt_hid`.
 
 ## PTT input modes
 
@@ -265,6 +271,187 @@ Black fiber example:
 - The `--codec-ptt` option switches PTT input handling to **KEY_ENTER**.
 - This is intended for embedded or codec-board GPIO/button input devices such as `ptt_keys`.
 - In `--codec-ptt` mode, PTT activation is immediate and does not use the AltGr delay logic.
+
+### UNIX socket PTT mode
+
+`ptt_client` can also listen for PTT commands on a UNIX datagram socket. This allows external programs to control PTT without modifying the audio client.
+
+Start the client with:
+
+```sh
+./ptt_client <server-ip> --ptt-socket /tmp/udpptt.sock --txid Alpha
+```
+
+Then send commands with `ptt_helper`:
+
+```sh
+./ptt_helper --socket /tmp/udpptt.sock --ptt_down
+./ptt_helper --socket /tmp/udpptt.sock --ptt_up
+./ptt_helper --socket /tmp/udpptt.sock --toggle
+```
+
+The socket accepts these command strings:
+
+```text
+DOWN
+UP
+TOGGLE
+```
+
+`ptt_helper` is mainly useful for scripts, desktop shortcuts, hardware button wrappers, and debugging.
+
+### USB HID headset PTT mode with `ptt_hid`
+
+`ptt_hid` is a small helper for using USB HID buttons as PTT controls. It is useful for headsets such as the Plantronics / Poly Blackwire 3225, which exposes its volume and mute buttons as Linux input events:
+
+```text
+KEY_VOLUMEUP
+KEY_VOLUMEDOWN
+KEY_MICMUTE
+```
+
+`ptt_hid` opens the selected `/dev/input/event*` device, uses an exclusive evdev grab, and sends PTT commands to `ptt_client` through the UNIX socket enabled by `--ptt-socket`. While `ptt_hid` is running with grabbing enabled, the desktop environment should not also receive that headset HID button event. This is useful on Wayland desktops where global media keys may otherwise change the system volume.
+
+Start `ptt_client` with a PTT socket:
+
+```sh
+./ptt_client 198.51.100.10 \
+    --ptt-socket /tmp/udpptt.sock \
+    --txid Alpha \
+    --encrypt --key 'shared room secret'
+```
+
+Then start `ptt_hid`:
+
+```sh
+sudo ./ptt_hid --socket /tmp/udpptt.sock --key volumeup
+```
+
+By default, `ptt_hid` looks for this Plantronics / Poly USB device:
+
+```text
+vendor  = 0x047f
+product = 0xc058
+```
+
+The default HID button is `KEY_VOLUMEUP`.
+
+#### Toggle behavior
+
+Many headset volume buttons do not report a normal held key state. Instead, they emit short press/release pulses and may repeat those pulses while the physical button is held. Some headsets also generate their own audible beep for each volume-button pulse.
+
+For this reason, `ptt_hid` uses toggle behavior by default:
+
+```text
+first accepted button press  -> sends DOWN
+second accepted button press -> sends UP
+```
+
+A re-arm delay prevents duplicate pulses from one physical press from immediately toggling PTT back off. The default is:
+
+```text
+800 ms
+```
+
+You can change it with:
+
+```sh
+sudo ./ptt_hid --socket /tmp/udpptt.sock --key volumeup --rearm-ms 500
+```
+
+If a second intentional press is ignored, lower `--rearm-ms`. If one physical press sometimes toggles twice, increase `--rearm-ms`.
+
+#### Auto-release timeout
+
+`ptt_hid` also has an automatic release watchdog. If PTT is left on, it sends `UP` after a configurable number of seconds.
+
+The default is:
+
+```text
+60 seconds
+```
+
+Example with a 30 second timeout:
+
+```sh
+sudo ./ptt_hid \
+    --socket /tmp/udpptt.sock \
+    --key volumeup \
+    --auto-release-sec 30
+```
+
+Disable auto-release with:
+
+```sh
+sudo ./ptt_hid \
+    --socket /tmp/udpptt.sock \
+    --key volumeup \
+    --auto-release-sec 0
+```
+
+#### Selecting keys and devices
+
+List readable input devices:
+
+```sh
+sudo ./ptt_hid --list
+```
+
+Use a specific event device:
+
+```sh
+sudo ./ptt_hid \
+    --device /dev/input/event5 \
+    --socket /tmp/udpptt.sock \
+    --key volumeup
+```
+
+Use another supported key:
+
+```sh
+sudo ./ptt_hid --socket /tmp/udpptt.sock --key volumedown
+sudo ./ptt_hid --socket /tmp/udpptt.sock --key micmute
+```
+
+You can also match a different USB HID device by vendor and product ID:
+
+```sh
+sudo ./ptt_hid \
+    --vendor 0x047f \
+    --product 0xc058 \
+    --socket /tmp/udpptt.sock \
+    --key volumeup
+```
+
+For debugging only, grabbing can be disabled:
+
+```sh
+sudo ./ptt_hid --socket /tmp/udpptt.sock --key volumeup --no-grab
+```
+
+Without grabbing, the desktop may also receive the key event and change the system volume.
+
+#### Typical desktop workflow
+
+Terminal 1:
+
+```sh
+./ptt_client 198.51.100.10 \
+    --ptt-socket /tmp/udpptt.sock \
+    --txid Alpha \
+    --encrypt --key 'shared room secret'
+```
+
+Terminal 2:
+
+```sh
+sudo ./ptt_hid \
+    --socket /tmp/udpptt.sock \
+    --key volumeup \
+    --auto-release-sec 60
+```
+
+Press the headset Volume Up button once to start transmitting. Press it again to stop transmitting. If you forget to stop transmitting, `ptt_hid` sends PTT up automatically after the auto-release timeout.
 
 ## Audio device selection
 
@@ -310,6 +497,8 @@ It is also useful when testing black fiber mode with capabilities. If you run th
 - The client scans readable `/dev/input/event*` devices for the selected PTT key.
 - Membership in the `input` group is usually enough.
 - On embedded targets using `--codec-ptt`, make sure the `ptt_keys` input device is accessible to the user running `ptt_client`.
+- `ptt_hid` also needs read access to the selected `/dev/input/event*` device. It can be run as root for testing, or as a normal user if permissions allow.
+- `ptt_hid` uses an exclusive evdev grab by default. This prevents the host desktop from also consuming the selected headset HID button while `ptt_hid` is running.
 
 On Debian, a common approach is:
 
@@ -318,6 +507,18 @@ sudo usermod -aG input $USER
 ```
 
 Log out and back in after changing group membership.
+
+For a specific USB HID headset, a udev rule can be used instead of broad manual permission changes. For example, for the Plantronics / Poly device with vendor `047f` and product `c058`:
+
+```sh
+sudo tee /etc/udev/rules.d/90-udpptt-plantronics.rules >/dev/null <<'EOF'
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{idVendor}=="047f", ATTRS{idProduct}=="c058", GROUP="input", MODE="0660"
+EOF
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+```
+
+Then unplug and reconnect the headset, or reboot.
 
 ### Raw Ethernet permissions for black fiber mode
 
@@ -635,6 +836,48 @@ Before using a user service in black fiber mode, apply the raw socket capability
 ```sh
 sudo setcap cap_net_raw+ep /usr/local/bin/ptt_client
 ```
+
+### Example systemd user service with `ptt_hid`
+
+When using `ptt_hid`, `ptt_client` should be started with a UNIX PTT socket:
+
+```ini
+[Unit]
+Description=udpptt client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/udpptt
+EnvironmentFile=%h/.config/udpptt/udpptt.env
+ExecStart=/usr/local/bin/ptt_client ${SERVER_IP} --ptt-socket /tmp/udpptt.sock --txid ${CALL_SIGN} --encrypt --key ${WORD_OF_DAY}
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+```
+
+A separate service can run `ptt_hid` as the same user if that user can read the headset input device:
+
+```ini
+[Unit]
+Description=udpptt HID PTT helper
+After=udpptt.service
+Requires=udpptt.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ptt_hid --socket /tmp/udpptt.sock --key volumeup --auto-release-sec 60
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+```
+
+If the helper is run as a user service, configure `/dev/input/event*` permissions first, for example with the `input` group or a udev rule.
 
 ## TPM2-backed secret with systemd-creds (work in progress)
 

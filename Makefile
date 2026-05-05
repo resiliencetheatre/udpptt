@@ -21,7 +21,7 @@ SODIUM_LIBS   := $(shell pkg-config --libs libsodium 2>/dev/null)
 CLIENT_CFLAGS := $(GST_CFLAGS) $(SODIUM_CFLAGS)
 CLIENT_LIBS   := $(GST_LIBS) $(SODIUM_LIBS)
 
-TARGETS = ptt_client ptt_server ptt_helper
+TARGETS = ptt_client ptt_server ptt_helper ptt_hid
 DATAFILES = start.wav stop.wav
 
 all: $(TARGETS)
@@ -35,11 +35,15 @@ ptt_server: ptt_server.c
 ptt_helper: ptt_helper.c
 	$(CC) $(CFLAGS) -o $@ $<
 
+ptt_hid: ptt_hid.c
+	$(CC) $(CFLAGS) -o $@ $<
+
 install: all
 	mkdir -p "$(DESTDIR)$(BINDIR)"
 	install -m 0755 ptt_client "$(DESTDIR)$(BINDIR)/ptt_client"
 	install -m 0755 ptt_server "$(DESTDIR)$(BINDIR)/ptt_server"
 	install -m 0755 ptt_helper "$(DESTDIR)$(BINDIR)/ptt_helper"
+	install -m 0755 ptt_hid "$(DESTDIR)$(BINDIR)/ptt_hid"
 
 	mkdir -p "$(DESTDIR)$(DATADIR)"
 	for f in $(DATAFILES); do \
@@ -61,7 +65,7 @@ install: all
 'Type=simple' \
 'WorkingDirectory=$(DATADIR)' \
 'EnvironmentFile=%h/.config/udpptt/udpptt.env' \
-'ExecStart=$(BINDIR)/ptt_client $${SERVER_IP} --altgr-ptt-delay-ms $${ALTGR_PTT_DELAY_MS} --txid $${CALL_SIGN} --encrypt --key $${WORD_OF_DAY}' \
+'ExecStart=$(BINDIR)/ptt_client $${SERVER_IP} --ptt-socket $${PTT_SOCKET} --altgr-ptt-delay-ms $${ALTGR_PTT_DELAY_MS} --txid $${CALL_SIGN} --encrypt --key $${WORD_OF_DAY}' \
 'Restart=always' \
 'RestartSec=3' \
 '' \
@@ -75,6 +79,7 @@ install: all
 'CALL_SIGN=Alpha' \
 'WORD_OF_DAY=shared-room-secret' \
 'ALTGR_PTT_DELAY_MS=2000' \
+'PTT_SOCKET=/tmp/udpptt.sock' \
 > "$(USER_CONFIG_DIR)/$(ENV_NAME)"; \
 	fi
 
@@ -93,13 +98,17 @@ install: all
 	@echo "  systemctl --user daemon-reload"
 	@echo "  systemctl --user enable --now $(SERVICE_NAME)"
 	@echo
-	@echo "If keyboard PTT is used, make sure that user can read /dev/input/event*:"
+	@echo "For HID PTT, run ptt_hid separately, for example:"
+	@echo "  ptt_hid --socket /tmp/udpptt.sock --key volumeup"
+	@echo
+	@echo "If keyboard or HID PTT is used, make sure that user can read the needed /dev/input/event* device:"
 	@echo "  sudo usermod -aG input $(REAL_USER)"
 
 uninstall:
 	rm -f "$(DESTDIR)$(BINDIR)/ptt_client"
 	rm -f "$(DESTDIR)$(BINDIR)/ptt_server"
 	rm -f "$(DESTDIR)$(BINDIR)/ptt_helper"
+	rm -f "$(DESTDIR)$(BINDIR)/ptt_hid"
 	rm -f "$(DESTDIR)$(DATADIR)/start.wav"
 	rm -f "$(DESTDIR)$(DATADIR)/stop.wav"
 	rmdir "$(DESTDIR)$(DATADIR)" 2>/dev/null || true
