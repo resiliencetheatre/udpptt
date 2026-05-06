@@ -987,6 +987,12 @@ If you want to completely clear the TPM itself, that is a much more destructive 
 ```sh
 sudo tpm2_clear
 ```
+# Gnome extension
+
+![gnome picture](img/gnome-extension.png "gnome-extension")
+
+Check `gnome-shell-extension` directory for experimental gnome shell extension,
+which will indicate transmit and receive status from ptt_client.
 
 
 License
