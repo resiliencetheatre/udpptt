@@ -994,6 +994,26 @@ sudo tpm2_clear
 Check `gnome-shell-extension` directory for experimental gnome shell extension,
 which will indicate transmit and receive status from ptt_client.
 
+If you wish to use systemd user service to start ptt_client with gnome extensions,
+use following `.config/systemd/user/udpptt.service` file:
+
+``` 
+[Unit]
+Description=udpptt client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/udpptt
+EnvironmentFile=%h/.config/udpptt/udpptt.env
+ExecStart=/usr/local/bin/ptt_client ${SERVER_IP} --altgr-ptt-delay-ms ${ALTGR_PTT_DELAY_MS} --txid ${CALL_SIGN} --state-file "%t/udpptt/state" --encrypt --key ${WORD_OF_DAY}
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+```
 
 License
 =======
