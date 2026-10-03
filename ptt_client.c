@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <gst/app/app.h>
 #include <gst/gst.h>
+#include <gst/audio/audio.h>
 #include <linux/if_ether.h>
 #include <linux/if_packet.h>
 #include <linux/input.h>
@@ -30,34 +31,21 @@
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
+#include "ptt_protocol.h"
+#include "ptt_jitter.h"
 
 #define DEFAULT_SERVER_PORT 5000
 #define DEFAULT_BLACKFIBER_ETHERTYPE 0x88B5
 #define LOCAL_PORT 0
-#define MAX_PACKET 2048
 #define MAX_FRAME (MAX_PACKET + 128)
-#define PKT_IDLE 0
-#define PKT_AUDIO 1
 #define INPUT_SCAN_MAX 64
-#define TALK_ID_MAX 31
-#define PKT_FLAG_ENCRYPTED 0x01
-#define NONCE_LEN crypto_aead_xchacha20poly1305_ietf_NPUBBYTES
 #define KEY_LEN crypto_aead_xchacha20poly1305_ietf_KEYBYTES
-#define AAD_LEN (1 + 1 + (TALK_ID_MAX + 1))
 #define ALSA_DEV_MAX 128
 
 typedef enum {
     TRANSPORT_UDP = 0,
     TRANSPORT_BLACKFIBER = 1
 } transport_mode_t;
-
-typedef struct __attribute__((packed)) {
-    uint8_t type;
-    uint8_t flags;
-    uint16_t len;
-    char talk_id[TALK_ID_MAX + 1];
-    uint8_t nonce[NONCE_LEN];
-} packet_hdr_t;
 
 typedef struct __attribute__((packed)) {
     uint8_t dst[ETH_ALEN];
@@ -79,6 +67,17 @@ typedef struct {
     int state_file_enabled;
     char state_file_path[PATH_MAX];
     int rx_state_timeout_ms;
+    int jitter_ms, loss_percent, fec_enabled;
+    uint8_t tx_session[16];
+    uint32_t tx_seq;
+    atomic_uint ptt_generation;
+    pthread_mutex_t jitter_lock;
+    ptt_jitter_t jitter;
+    pthread_t play_thread;
+    atomic_ulong rx_invalid_packets, playback_errors, playback_warnings;
+    atomic_ulong playback_starvations, playback_queue_drops, playback_schedule_late;
+    atomic_ulong rx_suppressed_packets;
+    atomic_ulong tx_capture_gaps;
     pthread_mutex_t state_lock;
     int state_tx_pressed;
     int state_rx_active;
@@ -133,6 +132,7 @@ static const unsigned char g_pwhash_salt[crypto_pwhash_SALTBYTES] = {
 };
 
 static long long now_ms(void) { struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL; }
+static int64_t mono_ms(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000; }
 static void msleep_int(int ms) { struct timespec ts; ts.tv_sec = ms / 1000; ts.tv_nsec = (ms % 1000) * 1000000L; nanosleep(&ts, NULL); }
 static void on_sigint(int sig) { (void)sig; atomic_store(&g_app.running, 0); }
 
@@ -383,10 +383,10 @@ static int make_blackfiber_socket(app_t *app) {
     return fd;
 }
 
-static GstElement *make_capture_pipeline(GstElement **out_sink, const char *alsa_device) {
-    GError *err = NULL; char desc[512];
-    if (alsa_device && alsa_device[0]) snprintf(desc, sizeof(desc), "alsasrc device=\"%s\" ! audio/x-raw,format=S16LE,channels=1,rate=48000 ! audioconvert ! audioresample ! opusenc frame-size=20 bitrate=24000 audio-type=voice ! appsink name=capture_sink emit-signals=false sync=false max-buffers=8 drop=true", alsa_device);
-    else snprintf(desc, sizeof(desc), "autoaudiosrc ! audio/x-raw,format=S16LE,channels=1,rate=48000 ! audioconvert ! audioresample ! opusenc frame-size=20 bitrate=24000 audio-type=voice ! appsink name=capture_sink emit-signals=false sync=false max-buffers=8 drop=true");
+static GstElement *make_capture_pipeline(GstElement **out_sink, const char *alsa_device, int fec, int loss) {
+    GError *err = NULL; char desc[768];
+    if (alsa_device && alsa_device[0]) snprintf(desc, sizeof(desc), "alsasrc device=\"%s\" ! audio/x-raw,format=S16LE,channels=1,rate=48000 ! audioconvert ! audioresample ! opusenc frame-size=20 bitrate=24000 audio-type=voice inband-fec=%s packet-loss-percentage=%d ! appsink name=capture_sink emit-signals=false sync=false max-buffers=8 drop=true", alsa_device, fec ? "true" : "false", loss);
+    else snprintf(desc, sizeof(desc), "autoaudiosrc ! audio/x-raw,format=S16LE,channels=1,rate=48000 ! audioconvert ! audioresample ! opusenc frame-size=20 bitrate=24000 audio-type=voice inband-fec=%s packet-loss-percentage=%d ! appsink name=capture_sink emit-signals=false sync=false max-buffers=8 drop=true", fec ? "true" : "false", loss);
     GstElement *pipeline = gst_parse_launch(desc, &err);
     if (!pipeline || err) { fprintf(stderr, "capture pipeline error: %s\n", err ? err->message : "unknown"); if (err) g_error_free(err); if (pipeline) gst_object_unref(pipeline); return NULL; }
     *out_sink = gst_bin_get_by_name(GST_BIN(pipeline), "capture_sink"); if (!*out_sink) { fprintf(stderr, "failed to get capture_sink\n"); gst_object_unref(pipeline); return NULL; }
@@ -395,17 +395,15 @@ static GstElement *make_capture_pipeline(GstElement **out_sink, const char *alsa
 
 static GstElement *make_playback_pipeline(GstElement **out_src, const char *alsa_device) {
     GError *err = NULL; char desc[512];
-    if (alsa_device && alsa_device[0]) snprintf(desc, sizeof(desc), "appsrc name=play_src is-live=true format=time block=false do-timestamp=true ! opusdec ! audioconvert ! audioresample ! alsasink device=\"%s\" sync=false", alsa_device);
-    else snprintf(desc, sizeof(desc), "appsrc name=play_src is-live=true format=time block=false do-timestamp=true ! opusdec ! audioconvert ! audioresample ! autoaudiosink");
+    if (alsa_device && alsa_device[0]) snprintf(desc, sizeof(desc), "appsrc name=play_src is-live=true format=time block=false do-timestamp=true max-buffers=5 max-bytes=0 max-time=0 leaky-type=downstream ! audioconvert ! audioresample ! alsasink device=\"%s\" sync=false", alsa_device);
+    else snprintf(desc, sizeof(desc), "appsrc name=play_src is-live=true format=time block=false do-timestamp=true max-buffers=5 max-bytes=0 max-time=0 leaky-type=downstream ! audioconvert ! audioresample ! autoaudiosink sync=false");
     GstElement *pipeline = gst_parse_launch(desc, &err);
     if (!pipeline || err) { fprintf(stderr, "playback pipeline error: %s\n", err ? err->message : "unknown"); if (err) g_error_free(err); if (pipeline) gst_object_unref(pipeline); return NULL; }
     *out_src = gst_bin_get_by_name(GST_BIN(pipeline), "play_src"); if (!*out_src) { fprintf(stderr, "failed to get play_src\n"); gst_object_unref(pipeline); return NULL; }
-    GstCaps *caps = gst_caps_new_simple("audio/x-opus", "rate", G_TYPE_INT, 48000, "channels", G_TYPE_INT, 1, "channel-mapping-family", G_TYPE_INT, 0, NULL);
+    GstCaps *caps = gst_caps_new_simple("audio/x-raw", "format", G_TYPE_STRING, GST_AUDIO_NE(S16), "layout", G_TYPE_STRING, "interleaved", "rate", G_TYPE_INT, 48000, "channels", G_TYPE_INT, 1, NULL);
     g_object_set(*out_src, "caps", caps, "stream-type", 0, "format", GST_FORMAT_TIME, NULL); gst_caps_unref(caps);
     gst_element_set_state(pipeline, GST_STATE_PLAYING); return pipeline;
 }
-
-static void make_aad(uint8_t type, uint8_t flags, const char talk_id[TALK_ID_MAX + 1], unsigned char aad[AAD_LEN]) { memset(aad, 0, AAD_LEN); aad[0] = type; aad[1] = flags; memcpy(aad + 2, talk_id, strnlen(talk_id, TALK_ID_MAX + 1)); }
 
 static bool send_packet(app_t *app, uint8_t type, const uint8_t *payload, uint16_t plain_len) {
     packet_hdr_t hdr;
@@ -413,17 +411,21 @@ static bool send_packet(app_t *app, uint8_t type, const uint8_t *payload, uint16
     const uint8_t *wire_payload = payload;
     unsigned char cipher[MAX_PACKET];
 
-    memset(&hdr, 0, sizeof(hdr));
-    hdr.type = type;
+    ptt_header_init(&hdr, type);
+    if (type != PKT_IDLE) {
+        memcpy(hdr.session, app->tx_session, sizeof(hdr.session));
+        hdr.seq = htonl(app->tx_seq);
+        hdr.timestamp = htonl(app->tx_seq * (uint32_t)PTT_SAMPLES);
+        if (type == PKT_AUDIO) { hdr.samples = htons(PTT_SAMPLES); app->tx_seq++; }
+    }
+    hdr.len = htons(plain_len + (app->encrypt_enabled ? PTT_TAG_BYTES : 0));
     memcpy(hdr.talk_id, app->txid, strnlen(app->txid, TALK_ID_MAX + 1));
 
-    if (type == PKT_AUDIO && app->encrypt_enabled) {
+    if (app->encrypt_enabled) {
         hdr.flags |= PKT_FLAG_ENCRYPTED;
         randombytes_buf(hdr.nonce, sizeof(hdr.nonce));
-        unsigned char aad[AAD_LEN];
-        make_aad(hdr.type, hdr.flags, hdr.talk_id, aad);
         if (plain_len + crypto_aead_xchacha20poly1305_ietf_ABYTES > sizeof(cipher)) { fprintf(stderr, "encrypted packet too large: %u\n", plain_len); return false; }
-        if (crypto_aead_xchacha20poly1305_ietf_encrypt(cipher, &wire_len, payload, plain_len, aad, sizeof(aad), NULL, hdr.nonce, app->key) != 0) { fprintf(stderr, "encrypt failed\n"); return false; }
+        if (crypto_aead_xchacha20poly1305_ietf_encrypt(cipher, &wire_len, payload, plain_len, (const unsigned char *)&hdr, sizeof(hdr), NULL, hdr.nonce, app->key) != 0) { fprintf(stderr, "encrypt failed\n"); return false; }
         wire_payload = cipher;
     }
 
@@ -463,9 +465,89 @@ static bool send_packet(app_t *app, uint8_t type, const uint8_t *payload, uint16
     }
 }
 
-static bool play_opus_packet(app_t *app, const uint8_t *data, uint16_t len) {
-    GstBuffer *buffer = gst_buffer_new_allocate(NULL, len, NULL); if (!buffer) return false;
-    gst_buffer_fill(buffer, 0, data, len); GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(app->playback_src), buffer); return ret == GST_FLOW_OK;
+static void report_rx_stats(app_t *app) {
+    pthread_mutex_lock(&app->jitter_lock);
+    ptt_rx_stats_t r = app->jitter.stats;
+    pthread_mutex_unlock(&app->jitter_lock);
+    printf("audio stats: accepted=%llu decoded=%llu missing=%llu fec_attempts=%llu plc=%llu late=%llu duplicate=%llu reordered=%llu invalid=%llu overflow=%llu rebuffer=%llu timeouts=%llu jitter_ms=%.1f suppressed=%lu queue_drops=%lu scheduling_late=%lu audio_errors=%lu audio_warnings=%lu stream_failed_warnings=%lu capture_gaps=%lu tx_audio=%lu rx_audio=%lu auth_fail=%lu\n",
+        (unsigned long long)r.accepted, (unsigned long long)r.decoded,
+        (unsigned long long)r.missing, (unsigned long long)r.fec_attempts,
+        (unsigned long long)r.plc, (unsigned long long)r.late,
+        (unsigned long long)r.duplicates, (unsigned long long)r.reordered,
+        (unsigned long long)(r.invalid + atomic_load(&app->rx_invalid_packets)),
+        (unsigned long long)r.overflow, (unsigned long long)r.rebuffered,
+        (unsigned long long)r.timeouts, r.jitter_ms,
+        atomic_load(&app->rx_suppressed_packets), atomic_load(&app->playback_queue_drops),
+        atomic_load(&app->playback_schedule_late), atomic_load(&app->playback_errors),
+        atomic_load(&app->playback_warnings), atomic_load(&app->playback_starvations),
+        atomic_load(&app->tx_capture_gaps), atomic_load(&app->tx_audio_packets),
+        atomic_load(&app->rx_audio_packets), atomic_load(&app->rx_decrypt_failures));
+    fflush(stdout);
+}
+
+static void check_audio_bus(app_t *app, GstElement *pipeline) {
+    if (!pipeline) return;
+    GstBus *bus = gst_element_get_bus(pipeline);
+    GstMessage *msg;
+    while ((msg = gst_bus_pop_filtered(bus, GST_MESSAGE_ERROR | GST_MESSAGE_WARNING))) {
+        GError *err = NULL; gchar *debug = NULL;
+        if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR) {
+            gst_message_parse_error(msg, &err, &debug);
+            atomic_fetch_add(&app->playback_errors, 1);
+        } else {
+            gst_message_parse_warning(msg, &err, &debug);
+            atomic_fetch_add(&app->playback_warnings, 1);
+            if (err && err->domain == GST_STREAM_ERROR && err->code == GST_STREAM_ERROR_FAILED)
+                atomic_fetch_add(&app->playback_starvations, 1);
+        }
+        fprintf(stderr, "audio %s (%s): %s [%s]\n",
+            GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR ? "error" : "warning",
+            GST_OBJECT_NAME(msg->src), err ? err->message : "unknown", debug ? debug : "");
+        g_clear_error(&err); g_free(debug); gst_message_unref(msg);
+    }
+    gst_object_unref(bus);
+}
+
+static void *play_thread_main(void *arg) {
+    app_t *app = arg;
+    int64_t due = mono_ms();
+    int was_suppressed = 0;
+    while (atomic_load(&app->running)) {
+        int64_t now = mono_ms();
+        if (now < due) { msleep_int((int)(due - now)); continue; }
+        if (now - due >= PTT_FRAME_MS) {
+            atomic_fetch_add(&app->playback_schedule_late, 1);
+            due = now;
+        }
+        due += PTT_FRAME_MS;
+        int16_t pcm[PTT_SAMPLES] = {0};
+        int suppressed = atomic_load(&app->suppress_playback);
+        pthread_mutex_lock(&app->jitter_lock);
+        if (suppressed) ptt_jitter_suppress(&app->jitter);
+        else ptt_jitter_render(&app->jitter, now, pcm);
+        pthread_mutex_unlock(&app->jitter_lock);
+        if (suppressed && !was_suppressed) {
+            /* Discard PCM already queued before pressing local PTT. */
+            gst_element_set_state(app->playback_pipeline, GST_STATE_READY);
+            gst_element_set_state(app->playback_pipeline, GST_STATE_PLAYING);
+        }
+        was_suppressed = suppressed;
+        guint64 queued = 0;
+        g_object_get(app->playback_src, "current-level-buffers", &queued, NULL);
+        /* Count explicit drops, not a guess based on appsrc's internal leak
+         * policy. The producer never waits for a stalled sound device. */
+        if (queued >= 5) atomic_fetch_add(&app->playback_queue_drops, 1);
+        GstBuffer *buffer = queued < 5 ? gst_buffer_new_allocate(NULL, sizeof(pcm), NULL) : NULL;
+        if (buffer) {
+            gst_buffer_fill(buffer, 0, pcm, sizeof(pcm));
+            GST_BUFFER_DURATION(buffer) = PTT_FRAME_MS * GST_MSECOND;
+            if (gst_app_src_push_buffer(GST_APP_SRC(app->playback_src), buffer) == GST_FLOW_OK)
+                atomic_fetch_add(&app->rx_played_packets, 1);
+            else atomic_fetch_add(&app->playback_errors, 1);
+        }
+        check_audio_bus(app, app->playback_pipeline);
+    }
+    return NULL;
 }
 
 static int file_exists_readable(const char *path) { return path && access(path, R_OK) == 0; }
@@ -493,6 +575,7 @@ static void play_tone_async(app_t *app, const char *path) {
 static void set_ptt_state(app_t *app, int pressed) {
     int old = atomic_exchange(&app->ptt_pressed, pressed); atomic_store(&app->suppress_playback, pressed);
     if (old != pressed) {
+        if (pressed) atomic_fetch_add(&app->ptt_generation, 1);
         printf("[%lld] PTT %s (txid=%s)\n", now_ms(), pressed ? "DOWN -> sending microphone audio" : "UP -> sending idle frames", app->txid); fflush(stdout);
         state_file_set_tx(app, pressed);
         if (pressed) { if (app->have_start_wav) play_tone_async(app, app->start_wav_path); }
@@ -510,7 +593,7 @@ static int make_ptt_control_socket(const char *path) {
     if (strlen(path) >= sizeof(addr.sun_path)) { fprintf(stderr, "ptt socket path too long: %s\n", path); return -1; }
     unlink(path);
     fd = socket(AF_UNIX, SOCK_DGRAM, 0); if (fd < 0) { perror("socket(AF_UNIX)"); return -1; }
-    memset(&addr, 0, sizeof(addr)); addr.sun_family = AF_UNIX; snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
+    memset(&addr, 0, sizeof(addr)); addr.sun_family = AF_UNIX; memcpy(addr.sun_path, path, strlen(path) + 1);
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) { perror("bind(AF_UNIX)"); close(fd); unlink(path); return -1; }
     tv.tv_sec = 0; tv.tv_usec = 200000; setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)); return fd;
 }
@@ -573,30 +656,62 @@ static void *keyboard_thread_main(void *arg) {
     return NULL;
 }
 
+static void finish_tx_session(app_t *app) {
+    /* Repetition is one-way compatible; receivers treat END idempotently. */
+    for (int i = 0; i < 3; ++i) send_packet(app, PKT_END, NULL, 0);
+}
+
 static void *send_thread_main(void *arg) {
-    app_t *app = (app_t *)arg; unsigned long last_report_audio = 0; unsigned long last_report_idle = 0;
+    app_t *app = arg;
+    unsigned generation = 0;
+    int transmitting = 0;
+    GstClockTime last_pts = GST_CLOCK_TIME_NONE;
     while (atomic_load(&app->running)) {
-        if (app->ptt_enabled && atomic_load(&app->ptt_pressed)) {
+        unsigned current = atomic_load(&app->ptt_generation);
+        int pressed = app->ptt_enabled && atomic_load(&app->ptt_pressed);
+        if (transmitting && (!pressed || current != generation)) {
+            finish_tx_session(app); transmitting = 0;
+        }
+        if (pressed && !transmitting) {
+            /* Capture runs while idle: discard old microphone frames. */
+            GstSample *stale;
+            while ((stale = gst_app_sink_try_pull_sample(GST_APP_SINK(app->capture_sink), 0)))
+                gst_sample_unref(stale);
+            randombytes_buf(app->tx_session, sizeof(app->tx_session));
+            app->tx_seq = 0;
+            last_pts = GST_CLOCK_TIME_NONE;
+            generation = current;
+            transmitting = 1;
+        }
+        if (transmitting) {
             GstSample *sample = gst_app_sink_try_pull_sample(GST_APP_SINK(app->capture_sink), 50 * GST_MSECOND);
             if (sample) {
                 GstBuffer *buffer = gst_sample_get_buffer(sample); GstMapInfo map;
-                if (gst_buffer_map(buffer, &map, GST_MAP_READ)) {
-                    if (send_packet(app, PKT_AUDIO, map.data, (uint16_t)map.size)) {
-                        unsigned long n = atomic_fetch_add(&app->tx_audio_packets, 1) + 1;
-                        if (n == 1 || n - last_report_audio >= 50) { printf("[%lld] TX mic audio packet #%lu (%zu bytes opus%s, txid=%s)\n", now_ms(), n, map.size, app->encrypt_enabled ? ", enc" : "", app->txid); fflush(stdout); last_report_audio = n; }
+                if (atomic_load(&app->ptt_pressed) && generation == atomic_load(&app->ptt_generation) &&
+                    gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+                    GstClockTime pts = GST_BUFFER_PTS(buffer);
+                    if (GST_CLOCK_TIME_IS_VALID(pts) && GST_CLOCK_TIME_IS_VALID(last_pts) && pts > last_pts) {
+                        uint64_t frames = (pts - last_pts + 10 * GST_MSECOND) / (PTT_FRAME_MS * GST_MSECOND);
+                        if (frames > 1 && frames < UINT32_MAX) {
+                            app->tx_seq += (uint32_t)(frames - 1);
+                            atomic_fetch_add(&app->tx_capture_gaps, (unsigned long)(frames - 1));
+                        }
                     }
+                    last_pts = pts;
+                    if (map.size <= PTT_OPUS_MAX &&
+                        opus_packet_get_nb_samples(map.data, (opus_int32)map.size, 48000) == PTT_SAMPLES &&
+                        send_packet(app, PKT_AUDIO, map.data, (uint16_t)map.size))
+                        atomic_fetch_add(&app->tx_audio_packets, 1);
                     gst_buffer_unmap(buffer, &map);
                 }
                 gst_sample_unref(sample);
-            } else { if (send_packet(app, PKT_IDLE, NULL, 0)) atomic_fetch_add(&app->tx_idle_packets, 1); msleep_int(20); }
-        } else {
-            if (send_packet(app, PKT_IDLE, NULL, 0)) {
-                unsigned long n = atomic_fetch_add(&app->tx_idle_packets, 1) + 1;
-                if (n == 1 || n - last_report_idle >= 200) { printf("[%lld] TX idle packet #%lu (txid=%s)\n", now_ms(), n, app->txid); fflush(stdout); last_report_idle = n; }
             }
+        } else {
+            if (send_packet(app, PKT_IDLE, NULL, 0)) atomic_fetch_add(&app->tx_idle_packets, 1);
             msleep_int(20);
         }
     }
+    if (transmitting) finish_tx_session(app);
     return NULL;
 }
 
@@ -620,28 +735,55 @@ static ssize_t recv_transport_packet(app_t *app, uint8_t *buf, size_t buf_sz) {
 }
 
 static void *recv_thread_main(void *arg) {
-    app_t *app = (app_t *)arg; uint8_t buf[MAX_PACKET]; unsigned long last_report_rx = 0; unsigned long last_report_play = 0; char current_talker[TALK_ID_MAX + 1] = {0};
+    app_t *app = arg;
+    uint8_t buf[MAX_PACKET];
     while (atomic_load(&app->running)) {
         ssize_t n = recv_transport_packet(app, buf, sizeof(buf));
-        if (n < 0) { if (n == -2 || errno == EAGAIN || errno == EWOULDBLOCK) { state_file_check_rx_timeout(app); continue; } perror("recv"); break; }
-        if ((size_t)n < sizeof(packet_hdr_t)) continue;
-        packet_hdr_t hdr; memcpy(&hdr, buf, sizeof(hdr)); hdr.talk_id[TALK_ID_MAX] = '\0'; uint16_t len = ntohs(hdr.len); if ((size_t)n < sizeof(hdr) + len) continue;
-        if (hdr.type == PKT_IDLE) { unsigned long idle_n = atomic_fetch_add(&app->rx_ignored_idle_packets, 1) + 1; if (idle_n == 1 || idle_n % 200 == 0) { printf("[%lld] RX idle packet ignored #%lu (from=%s)\n", now_ms(), idle_n, hdr.talk_id); fflush(stdout); } state_file_check_rx_timeout(app); continue; }
-        if (hdr.type != PKT_AUDIO || len == 0) continue;
-        if (strcmp(current_talker, hdr.talk_id) != 0) { snprintf(current_talker, sizeof(current_talker), "%s", hdr.talk_id); printf("[%lld] TALKER now: %s\n", now_ms(), current_talker[0] ? current_talker : "?"); fflush(stdout); }
-        unsigned char plain[MAX_PACKET]; const uint8_t *opus = buf + sizeof(hdr); unsigned long long opus_len = len;
-        if (hdr.flags & PKT_FLAG_ENCRYPTED) {
-            if (!app->encrypt_enabled) { unsigned long bad = atomic_fetch_add(&app->rx_decrypt_failures, 1) + 1; if (bad == 1 || bad % 50 == 0) { printf("[%lld] RX encrypted audio from=%s but local client is not in --encrypt mode\n", now_ms(), hdr.talk_id); fflush(stdout); } continue; }
-            unsigned char aad[AAD_LEN]; make_aad(hdr.type, hdr.flags, hdr.talk_id, aad);
-            if (crypto_aead_xchacha20poly1305_ietf_decrypt(plain, &opus_len, NULL, buf + sizeof(hdr), len, aad, sizeof(aad), hdr.nonce, app->key) != 0) { unsigned long bad = atomic_fetch_add(&app->rx_decrypt_failures, 1) + 1; if (bad == 1 || bad % 50 == 0) { printf("[%lld] RX decrypt/auth failure #%lu from=%s\n", now_ms(), bad, hdr.talk_id); fflush(stdout); } continue; }
+        if (n < 0) {
+            if (n == -2 || errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                state_file_check_rx_timeout(app); continue;
+            }
+            perror("recv"); break;
+        }
+        packet_hdr_t hdr;
+        if ((size_t)n < sizeof(hdr)) { atomic_fetch_add(&app->rx_invalid_packets, 1); continue; }
+        memcpy(&hdr, buf, sizeof(hdr));
+        if (!ptt_header_valid(&hdr, (size_t)n)) {
+            unsigned long bad = atomic_fetch_add(&app->rx_invalid_packets, 1) + 1;
+            if (bad == 1 || bad % 100 == 0) fprintf(stderr, "RX invalid/unsupported packet (protocol v2 required), count=%lu\n", bad);
+            continue;
+        }
+        unsigned char plain[MAX_PACKET];
+        const uint8_t *opus = buf + sizeof(hdr);
+        unsigned long long len = ntohs(hdr.len);
+        if (!!(hdr.flags & PKT_FLAG_ENCRYPTED) != !!app->encrypt_enabled) {
+            atomic_fetch_add(&app->rx_decrypt_failures, 1); continue;
+        }
+        if (app->encrypt_enabled) {
+            if (crypto_aead_xchacha20poly1305_ietf_decrypt(plain, &len, NULL,
+                opus, len, (const unsigned char *)&hdr, sizeof(hdr), hdr.nonce, app->key) != 0) {
+                atomic_fetch_add(&app->rx_decrypt_failures, 1); continue;
+            }
             opus = plain;
         }
-        state_file_note_rx_audio(app, hdr.talk_id);
-        unsigned long rx_n = atomic_fetch_add(&app->rx_audio_packets, 1) + 1;
-        if (rx_n == 1 || rx_n - last_report_rx >= 50) { printf("[%lld] RX audio packet #%lu (%llu bytes opus%s, from=%s)\n", now_ms(), rx_n, opus_len, (hdr.flags & PKT_FLAG_ENCRYPTED) ? ", enc" : "", hdr.talk_id); fflush(stdout); last_report_rx = rx_n; }
-        if (atomic_load(&app->suppress_playback)) { if (rx_n == 1 || rx_n % 50 == 0) { printf("[%lld] RX audio suppressed while local PTT is active (from=%s)\n", now_ms(), hdr.talk_id); fflush(stdout); } continue; }
-        if (opus_len > UINT16_MAX) continue;
-        if (play_opus_packet(app, opus, (uint16_t)opus_len)) { unsigned long play_n = atomic_fetch_add(&app->rx_played_packets, 1) + 1; if (play_n == 1 || play_n - last_report_play >= 50) { printf("[%lld] PLAY audio packet #%lu (from=%s)\n", now_ms(), play_n, hdr.talk_id); fflush(stdout); last_report_play = play_n; } }
+        if (hdr.type == PKT_IDLE) {
+            atomic_fetch_add(&app->rx_ignored_idle_packets, 1);
+            state_file_check_rx_timeout(app); continue;
+        }
+        if (hdr.type == PKT_AUDIO) {
+            atomic_fetch_add(&app->rx_audio_packets, 1);
+            state_file_note_rx_audio(app, hdr.talk_id);
+        }
+        pthread_mutex_lock(&app->jitter_lock);
+        /* Register and then retire the session while muted, so its delayed
+         * packets cannot play after local PTT is released. */
+        ptt_jitter_put(&app->jitter, &hdr, opus, (size_t)len, mono_ms());
+        if (atomic_load(&app->suppress_playback)) {
+            ptt_jitter_suppress(&app->jitter);
+            atomic_fetch_add(&app->rx_suppressed_packets, 1);
+        }
+        pthread_mutex_unlock(&app->jitter_lock);
+        state_file_check_rx_timeout(app);
     }
     return NULL;
 }
@@ -653,14 +795,18 @@ static void cleanup(app_t *app) {
     if (app->ctrl_thread) pthread_join(app->ctrl_thread, NULL);
     if (app->send_thread) pthread_join(app->send_thread, NULL);
     if (app->recv_thread) pthread_join(app->recv_thread, NULL);
+    if (app->play_thread) pthread_join(app->play_thread, NULL);
+    report_rx_stats(app);
+    ptt_jitter_destroy(&app->jitter);
     if (app->capture_pipeline) { gst_element_set_state(app->capture_pipeline, GST_STATE_NULL); if (app->capture_sink) gst_object_unref(app->capture_sink); gst_object_unref(app->capture_pipeline); }
     if (app->playback_pipeline) { gst_element_set_state(app->playback_pipeline, GST_STATE_NULL); if (app->playback_src) { gst_app_src_end_of_stream(GST_APP_SRC(app->playback_src)); gst_object_unref(app->playback_src); } gst_object_unref(app->playback_pipeline); }
     if (app->sock >= 0) { close(app->sock); app->sock = -1; }
     if (app->state_file_enabled) state_file_write_idle(app);
     if (app->ptt_socket_enabled && app->ptt_socket_path[0]) unlink(app->ptt_socket_path);
     sodium_memzero(app->key, sizeof(app->key));
-    printf("summary: tx_audio=%lu tx_idle=%lu rx_audio=%lu played=%lu rx_idle_ignored=%lu decrypt_fail=%lu\n", (unsigned long)atomic_load(&app->tx_audio_packets), (unsigned long)atomic_load(&app->tx_idle_packets), (unsigned long)atomic_load(&app->rx_audio_packets), (unsigned long)atomic_load(&app->rx_played_packets), (unsigned long)atomic_load(&app->rx_ignored_idle_packets), (unsigned long)atomic_load(&app->rx_decrypt_failures));
+    printf("summary: tx_audio=%lu tx_idle=%lu rx_audio=%lu pcm_blocks_queued=%lu rx_idle_ignored=%lu decrypt_fail=%lu\n", (unsigned long)atomic_load(&app->tx_audio_packets), (unsigned long)atomic_load(&app->tx_idle_packets), (unsigned long)atomic_load(&app->rx_audio_packets), (unsigned long)atomic_load(&app->rx_played_packets), (unsigned long)atomic_load(&app->rx_ignored_idle_packets), (unsigned long)atomic_load(&app->rx_decrypt_failures));
     pthread_mutex_destroy(&app->state_lock);
+    pthread_mutex_destroy(&app->jitter_lock);
 }
 
 static void usage(const char *argv0) {
@@ -669,15 +815,26 @@ static void usage(const char *argv0) {
             "       [--codec-ptt] [--ptt-socket PATH] [--state-file PATH] [--rx-state-timeout-ms MS]\n"
             "       [--altgr-ptt-delay-ms MS] [--rpi-audio]\n"
             "       [--alsa-device DEV] [--alsa-capture-device DEV] [--alsa-playback-device DEV]\n"
+            "       [--jitter-ms 0..1000] [--fec-loss-percent 0..100] [--no-fec]\n"
             "       [--blackfiber IFACE] [--bf-dst-mac MAC] [--bf-ethertype ETHERTYPE]\n"
             "       [--blackfiber-rx-passive] [--blackfiber-tx-only]\n", argv0);
 }
 
 int main(int argc, char **argv) {
-    memset(&g_app, 0, sizeof(g_app)); pthread_mutex_init(&g_app.state_lock, NULL); g_app.sock = -1; g_app.ptt_ctrl_sock = -1; g_app.server_port = DEFAULT_SERVER_PORT; g_app.transport_mode = TRANSPORT_UDP; g_app.ptt_enabled = 1; g_app.pc_ptt_hold_ms = 2000; g_app.rx_state_timeout_ms = 1000; g_app.bf_ethertype = DEFAULT_BLACKFIBER_ETHERTYPE; memset(g_app.bf_dst_mac, 0xff, sizeof(g_app.bf_dst_mac)); snprintf(g_app.txid, sizeof(g_app.txid), "anon");
+    memset(&g_app, 0, sizeof(g_app)); pthread_mutex_init(&g_app.state_lock, NULL); pthread_mutex_init(&g_app.jitter_lock, NULL); g_app.jitter_ms = -1; g_app.loss_percent = 10; g_app.fec_enabled = 1; g_app.sock = -1; g_app.ptt_ctrl_sock = -1; g_app.server_port = DEFAULT_SERVER_PORT; g_app.transport_mode = TRANSPORT_UDP; g_app.ptt_enabled = 1; g_app.pc_ptt_hold_ms = 2000; g_app.rx_state_timeout_ms = 1000; g_app.bf_ethertype = DEFAULT_BLACKFIBER_ETHERTYPE; memset(g_app.bf_dst_mac, 0xff, sizeof(g_app.bf_dst_mac)); snprintf(g_app.txid, sizeof(g_app.txid), "anon");
     const char *server_ip = NULL; const char *password = NULL;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--rx-only") || !strcmp(argv[i], "--no-ptt")) g_app.ptt_enabled = 0;
+        else if (!strcmp(argv[i], "--no-fec")) g_app.fec_enabled = 0;
+        else if (!strcmp(argv[i], "--jitter-ms") || !strcmp(argv[i], "--fec-loss-percent")) {
+            int jitter = !strcmp(argv[i], "--jitter-ms");
+            if (i + 1 >= argc) { fprintf(stderr, "missing option value\n"); return 1; }
+            char *end; errno = 0; long v = strtol(argv[++i], &end, 10);
+            if (errno || !argv[i][0] || *end || v < 0 || v > (jitter ? 1000 : 100)) {
+                fprintf(stderr, "invalid recovery option value: %s\n", argv[i]); return 1;
+            }
+            if (jitter) g_app.jitter_ms = (int)v; else g_app.loss_percent = (int)v;
+        }
         else if (!strcmp(argv[i], "--encrypt")) g_app.encrypt_enabled = 1;
         else if (!strcmp(argv[i], "--codec-ptt")) g_app.codec_ptt_enabled = 1;
         else if (!strcmp(argv[i], "--ptt-socket") || !strcmp(argv[i], "--control-socket")) { if (i + 1 >= argc) { fprintf(stderr, "missing value for %s\n", argv[i]); return 1; } copy_opt_string(g_app.ptt_socket_path, sizeof(g_app.ptt_socket_path), argv[++i]); g_app.ptt_socket_enabled = 1; }
@@ -702,6 +859,9 @@ int main(int argc, char **argv) {
     }
 
     if (g_app.transport_mode == TRANSPORT_UDP) {
+        if (g_app.blackfiber_tx_only || g_app.blackfiber_rx_passive) {
+            fprintf(stderr, "Blackfiber direction options require --blackfiber IFACE\n"); return 1;
+        }
         if (!server_ip) { usage(argv[0]); return 1; }
     } else {
         if (!g_app.bf_ifname[0]) { fprintf(stderr, "--blackfiber requires interface name\n"); return 1; }
@@ -714,6 +874,8 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (g_app.jitter_ms < 0) g_app.jitter_ms = g_app.transport_mode == TRANSPORT_UDP ? 120 : 40;
+    ptt_jitter_init(&g_app.jitter, g_app.jitter_ms, g_app.fec_enabled);
     if (g_app.ptt_socket_enabled && !g_app.ptt_socket_path[0]) { fprintf(stderr, "--ptt-socket requires a non-empty path\n"); return 1; }
     if (g_app.state_file_enabled && !g_app.state_file_path[0]) { fprintf(stderr, "--state-file requires a non-empty path\n"); return 1; }
     if (sodium_init() < 0) { fprintf(stderr, "libsodium init failed\n"); return 1; }
@@ -728,8 +890,11 @@ int main(int argc, char **argv) {
     }
 
     if (g_app.ptt_socket_enabled) { g_app.ptt_ctrl_sock = make_ptt_control_socket(g_app.ptt_socket_path); if (g_app.ptt_ctrl_sock < 0) { cleanup(&g_app); return 1; } }
-    if (g_app.ptt_enabled) { g_app.capture_pipeline = make_capture_pipeline(&g_app.capture_sink, g_app.alsa_capture_device); if (!g_app.capture_pipeline) { cleanup(&g_app); return 1; } }
-    g_app.playback_pipeline = make_playback_pipeline(&g_app.playback_src, g_app.alsa_playback_device); if (!g_app.playback_pipeline) { cleanup(&g_app); return 1; }
+    if (g_app.ptt_enabled) { g_app.capture_pipeline = make_capture_pipeline(&g_app.capture_sink, g_app.alsa_capture_device, g_app.fec_enabled, g_app.loss_percent); if (!g_app.capture_pipeline) { cleanup(&g_app); return 1; } }
+    if (!g_app.blackfiber_tx_only) {
+        g_app.playback_pipeline = make_playback_pipeline(&g_app.playback_src, g_app.alsa_playback_device);
+        if (!g_app.playback_pipeline) { cleanup(&g_app); return 1; }
+    }
     init_ptt_tones(&g_app);
     atomic_store(&g_app.running, 1); atomic_store(&g_app.ptt_pressed, 0); atomic_store(&g_app.ptt_keyboard_pressed, 0); atomic_store(&g_app.ptt_socket_pressed, 0); atomic_store(&g_app.suppress_playback, 0);
     if (g_app.state_file_enabled) state_file_write_idle(&g_app);
@@ -749,6 +914,7 @@ int main(int argc, char **argv) {
         }
     }
 
+    printf("protocol=v2 jitter_ms=%d fec=%s expected_loss=%d%%\n", g_app.jitter_ms, g_app.fec_enabled ? "on" : "off", g_app.loss_percent);
     printf("txid: %s\n", g_app.txid); printf("debug: shows PTT state, transmitted mic packets, received audio packets, and playback events\n");
     if (!g_app.ptt_enabled) printf("mode: receive-only (--rx-only), keyboard PTT disabled, microphone capture disabled\n");
     if (g_app.encrypt_enabled) printf("encryption: enabled (XChaCha20-Poly1305 payload encryption, cleartext authenticated talk_id)\n"); else printf("encryption: disabled\n");
@@ -771,6 +937,16 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    while (atomic_load(&g_app.running)) msleep_int(100);
+    if (!(g_app.transport_mode == TRANSPORT_BLACKFIBER && g_app.blackfiber_tx_only)) {
+        if (pthread_create(&g_app.play_thread, NULL, play_thread_main, &g_app) != 0) {
+            perror("pthread_create(playback)"); cleanup(&g_app); return 1;
+        }
+    }
+    int64_t next_report = mono_ms() + 5000;
+    while (atomic_load(&g_app.running)) {
+        check_audio_bus(&g_app, g_app.capture_pipeline);
+        if (mono_ms() >= next_report) { report_rx_stats(&g_app); next_report = mono_ms() + 5000; }
+        msleep_int(100);
+    }
     cleanup(&g_app); return 0;
 }

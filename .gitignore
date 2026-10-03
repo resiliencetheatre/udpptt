@@ -3,3 +3,8 @@ ptt_client
 ptt_server
 ptt_helper
 *.o
+tests/test_recovery
+tests/test_client
+tests/test_recovery_sanitize
+tests/test_client_sanitize
+tests/ptt_server_sanitize

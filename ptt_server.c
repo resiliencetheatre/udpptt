@@ -1,5 +1,4 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
-
 #include <arpa/inet.h>
 #include <errno.h>
 #include <signal.h>
@@ -10,340 +9,183 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
-#include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#include "ptt_protocol.h"
 
 #define DEFAULT_SERVER_PORT 5000
-#define MAX_PACKET 2048
 #define MAX_CLIENTS 128
-#define PKT_IDLE 0
-#define PKT_AUDIO 1
-#define PKT_FLAG_ENCRYPTED 0x01
 #define CLIENT_TIMEOUT_MS 30000
-#define TALKER_HOLD_MS 300
-#define TALK_ID_MAX 31
-#define NONCE_LEN 24
-
-typedef struct __attribute__((packed)) {
-    uint8_t type;
-    uint8_t flags;
-    uint16_t len;
-    char talk_id[TALK_ID_MAX + 1];
-    uint8_t nonce[NONCE_LEN];
-} packet_hdr_t;
+#define CLOSED_SESSIONS 16
 
 typedef struct {
     int used;
     struct sockaddr_in addr;
-    long long last_seen_ms;
-    long long last_audio_ms;
-    char last_talk_id[TALK_ID_MAX + 1];
-    unsigned long rx_idle_packets;
-    unsigned long rx_audio_packets;
-    unsigned long tx_audio_packets;
+    int64_t last_seen_ms;
+    uint8_t closed[CLOSED_SESSIONS][16];
+    unsigned closed_next;
+    unsigned long rx_audio, forwarded, rejected;
 } client_t;
 
-static volatile sig_atomic_t g_running = 1;
+typedef struct {
+    int client, ending;
+    uint8_t session[16];
+    char talk_id[TALK_ID_MAX + 1];
+    uint32_t end_seq;
+    int64_t last_audio_ms, release_ms;
+} talker_t;
 
-static long long now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+static volatile sig_atomic_t running = 1;
+static int64_t now_ms(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
-
-static void on_sigint(int sig) {
-    (void)sig;
-    g_running = 0;
+static void on_signal(int sig) { (void)sig; running = 0; }
+static int number(const char *s, int lo, int hi) {
+    char *end; errno = 0; long v = strtol(s, &end, 10);
+    return errno || !*s || *end || v < lo || v > hi ? -1 : (int)v;
 }
-
-static int parse_udp_port(const char *s) {
-    char *endp = NULL;
-    long v;
-    if (!s || !s[0]) {
-        return -1;
-    }
-    errno = 0;
-    v = strtol(s, &endp, 10);
-    if (errno != 0 || !endp || *endp != '\0' || v < 1 || v > 65535) {
-        return -1;
-    }
-    return (int)v;
-}
-
-static void addr_to_text(const struct sockaddr_in *addr, char *out, size_t out_sz) {
-    char ip[INET_ADDRSTRLEN] = {0};
-    inet_ntop(AF_INET, &addr->sin_addr, ip, sizeof(ip));
-    snprintf(out, out_sz, "%s:%u", ip[0] ? ip : "?", (unsigned)ntohs(addr->sin_port));
-}
-
 static int same_addr(const struct sockaddr_in *a, const struct sockaddr_in *b) {
-    return a->sin_family == b->sin_family &&
-           a->sin_port == b->sin_port &&
-           a->sin_addr.s_addr == b->sin_addr.s_addr;
+    return a->sin_addr.s_addr == b->sin_addr.s_addr && a->sin_port == b->sin_port;
 }
-
-static const char *id_or_q(const char *s) {
-    return (s && s[0]) ? s : "?";
+static int closed_session(const client_t *c, const uint8_t session[16]) {
+    for (int i = 0; i < CLOSED_SESSIONS; ++i)
+        if (!memcmp(c->closed[i], session, 16)) return 1;
+    return 0;
 }
-
-static int find_client(client_t *clients, const struct sockaddr_in *addr) {
-    for (int i = 0; i < MAX_CLIENTS; ++i) {
-        if (clients[i].used && same_addr(&clients[i].addr, addr)) {
-            return i;
-        }
+static void release_talker(client_t *clients, talker_t *t, const char *reason) {
+    if (t->client < 0) return;
+    client_t *c = &clients[t->client];
+    /* A silence timeout releases arbitration but must allow the same PTT
+     * session to resume after a long mobile outage. */
+    if (t->ending || !strcmp(reason, "new session"))
+        memcpy(c->closed[c->closed_next++ % CLOSED_SESSIONS], t->session, 16);
+    printf("active talker released: id=%s reason=%s\n", t->talk_id, reason);
+    fflush(stdout);
+    t->client = -1; t->ending = 0;
+}
+static void maintain(client_t *clients, talker_t *t, int hold, int64_t now) {
+    if (t->client >= 0) {
+        if (t->ending && now >= t->release_ms) release_talker(clients, t, "PTT end");
+        else if (!t->ending && now - t->last_audio_ms >= hold) release_talker(clients, t, "audio timeout");
     }
-    return -1;
-}
-
-static int add_client(client_t *clients, const struct sockaddr_in *addr) {
     for (int i = 0; i < MAX_CLIENTS; ++i) {
-        if (!clients[i].used) {
-            memset(&clients[i], 0, sizeof(clients[i]));
-            clients[i].used = 1;
-            clients[i].addr = *addr;
-            clients[i].last_seen_ms = now_ms();
-            return i;
-        }
-    }
-    return -1;
-}
-
-static void remove_stale_clients(client_t *clients, int *active_talker) {
-    long long now = now_ms();
-    for (int i = 0; i < MAX_CLIENTS; ++i) {
-        if (!clients[i].used) {
-            continue;
-        }
-        if (now - clients[i].last_seen_ms > CLIENT_TIMEOUT_MS) {
-            char who[64];
-            addr_to_text(&clients[i].addr, who, sizeof(who));
-            printf("[%lld] client timeout removed: %s id=%s (rx_idle=%lu rx_audio=%lu tx_audio=%lu)\n",
-                   now, who, id_or_q(clients[i].last_talk_id),
-                   clients[i].rx_idle_packets, clients[i].rx_audio_packets, clients[i].tx_audio_packets);
-            fflush(stdout);
+        if (clients[i].used && now - clients[i].last_seen_ms >= CLIENT_TIMEOUT_MS) {
+            if (t->client == i) release_talker(clients, t, "client timeout");
             clients[i].used = 0;
-            if (*active_talker == i) {
-                *active_talker = -1;
-                printf("[%lld] active talker released due to timeout: %s\n", now, who);
-                fflush(stdout);
-            }
         }
-    }
-}
-
-static void maybe_release_active_talker(client_t *clients, int *active_talker) {
-    if (*active_talker < 0) {
-        return;
-    }
-    if (*active_talker >= MAX_CLIENTS || !clients[*active_talker].used) {
-        *active_talker = -1;
-        return;
-    }
-    long long now = now_ms();
-    if (now - clients[*active_talker].last_audio_ms > TALKER_HOLD_MS) {
-        char who[64];
-        addr_to_text(&clients[*active_talker].addr, who, sizeof(who));
-        printf("[%lld] active talker released after silence: %s id=%s\n",
-               now, who, id_or_q(clients[*active_talker].last_talk_id));
-        fflush(stdout);
-        *active_talker = -1;
     }
 }
 
 int main(int argc, char **argv) {
-    int server_port = DEFAULT_SERVER_PORT;
-
-    if (argc == 3 && (strcmp(argv[1], "--port") == 0 || strcmp(argv[1], "--udp-port") == 0)) {
-        int p = parse_udp_port(argv[2]);
-        if (p < 0) {
-            fprintf(stderr, "invalid UDP port: %s\n", argv[2]);
+    int port = DEFAULT_SERVER_PORT, hold = 1000, grace = 100;
+    for (int i = 1; i < argc; ++i) {
+        int *target, lo, hi;
+        if (!strcmp(argv[i], "--port") || !strcmp(argv[i], "--udp-port")) {
+            target = &port; lo = 1; hi = 65535;
+        } else if (!strcmp(argv[i], "--talker-hold-ms")) {
+            target = &hold; lo = 100; hi = 60000;
+        } else if (!strcmp(argv[i], "--release-grace-ms")) {
+            target = &grace; lo = 0; hi = 2000;
+        } else {
+            fprintf(stderr, "usage: %s [--port PORT] [--talker-hold-ms 100..60000] [--release-grace-ms 0..2000]\n", argv[0]);
             return 1;
         }
-        server_port = p;
-    } else if (argc != 1) {
-        fprintf(stderr, "usage: %s [--port PORT]\n", argv[0]);
-        return 1;
+        if (++i >= argc || (*target = number(argv[i], lo, hi)) < 0) {
+            fprintf(stderr, "invalid or missing option value\n"); return 1;
+        }
     }
-
-    signal(SIGINT, on_sigint);
-    signal(SIGTERM, on_sigint);
-
+    if (grace > hold) { fprintf(stderr, "release grace must not exceed talker hold\n"); return 1; }
+    signal(SIGINT, on_signal); signal(SIGTERM, on_signal);
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) {
-        perror("socket");
-        return 1;
-    }
-
+    if (sock < 0) { perror("socket"); return 1; }
     int one = 1;
-    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) < 0) {
-        perror("setsockopt(SO_REUSEADDR)");
-    }
-
-    struct timeval tv;
-    tv.tv_sec = 0;
-    tv.tv_usec = 200000;
-    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
-        perror("setsockopt(SO_RCVTIMEO)");
-    }
-
-    struct sockaddr_in srv;
-    memset(&srv, 0, sizeof(srv));
-    srv.sin_family = AF_INET;
-    srv.sin_addr.s_addr = htonl(INADDR_ANY);
-    srv.sin_port = htons((uint16_t)server_port);
-
-    if (bind(sock, (struct sockaddr *)&srv, sizeof(srv)) < 0) {
-        perror("bind");
-        close(sock);
-        return 1;
-    }
-
-    client_t clients[MAX_CLIENTS];
-    memset(clients, 0, sizeof(clients));
-    int active_talker = -1;
-    unsigned long total_rx_idle = 0;
-    unsigned long total_rx_audio = 0;
-    unsigned long total_forwarded = 0;
-
-    printf("ptt_server listening on UDP port %d\n", server_port);
-    printf("protocol: type=0 idle, type=1 opus audio, cleartext talk_id, optional encrypted payload\n");
-    printf("policy: first client sending audio gets talker slot until %d ms of silence\n", TALKER_HOLD_MS);
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct timeval tv = {.tv_sec = 0, .tv_usec = 20000};
+    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) { perror("SO_RCVTIMEO"); close(sock); return 1; }
+    struct sockaddr_in srv = {.sin_family = AF_INET, .sin_port = htons((uint16_t)port), .sin_addr.s_addr = htonl(INADDR_ANY)};
+    if (bind(sock, (struct sockaddr *)&srv, sizeof(srv)) < 0) { perror("bind"); close(sock); return 1; }
+    client_t clients[MAX_CLIENTS] = {0};
+    talker_t talker = {.client = -1};
+    unsigned long invalid = 0, rejected = 0, forwarded = 0, send_errors = 0, audio = 0;
+    int64_t next_report = now_ms() + 5000;
+    printf("ptt_server UDP port=%d protocol=v2 talker_hold_ms=%d release_grace_ms=%d\n", port, hold, grace);
     fflush(stdout);
-
-    while (g_running) {
-        remove_stale_clients(clients, &active_talker);
-        maybe_release_active_talker(clients, &active_talker);
-
-        uint8_t buf[MAX_PACKET];
-        struct sockaddr_in src;
-        socklen_t src_len = sizeof(src);
+    while (running) {
+        uint8_t buf[MAX_PACKET]; struct sockaddr_in src; socklen_t src_len = sizeof(src);
         ssize_t n = recvfrom(sock, buf, sizeof(buf), 0, (struct sockaddr *)&src, &src_len);
-        long long now = now_ms();
-
+        int64_t now = now_ms();
+        /* Expire before processing an arriving packet, including after a wait. */
+        maintain(clients, &talker, hold, now);
+        if (now >= next_report) {
+            printf("server stats: audio=%lu forwarded=%lu rejected=%lu invalid=%lu send_errors=%lu\n", audio, forwarded, rejected, invalid, send_errors);
+            fflush(stdout); next_report = now + 5000;
+        }
         if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                continue;
-            }
-            perror("recvfrom");
-            break;
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
+            perror("recvfrom"); break;
         }
-        if ((size_t)n < sizeof(packet_hdr_t)) {
-            continue;
-        }
-
         packet_hdr_t hdr;
+        if ((size_t)n < sizeof(hdr)) { invalid++; continue; }
         memcpy(&hdr, buf, sizeof(hdr));
-        hdr.talk_id[TALK_ID_MAX] = '\0';
-        uint16_t len = ntohs(hdr.len);
-        if ((size_t)n < sizeof(hdr) + len) {
+        if (!ptt_header_valid(&hdr, (size_t)n)) {
+            if (++invalid == 1 || invalid % 100 == 0) fprintf(stderr, "invalid packet: protocol v2 required (count=%lu)\n", invalid);
             continue;
         }
-
-        int idx = find_client(clients, &src);
-        if (idx < 0) {
-            idx = add_client(clients, &src);
-            if (idx < 0) {
-                fprintf(stderr, "client table full, dropping packet\n");
-                continue;
-            }
-            char who[64];
-            addr_to_text(&src, who, sizeof(who));
-            printf("[%lld] new client registered: %s\n", now, who);
-            fflush(stdout);
-        }
-
-        clients[idx].last_seen_ms = now;
-        memset(clients[idx].last_talk_id, 0, sizeof(clients[idx].last_talk_id));
-        memcpy(clients[idx].last_talk_id, hdr.talk_id, strnlen(hdr.talk_id, TALK_ID_MAX));
-
-        if (hdr.type == PKT_IDLE) {
-            total_rx_idle++;
-            clients[idx].rx_idle_packets++;
-            if (clients[idx].rx_idle_packets == 1 || clients[idx].rx_idle_packets % 500 == 0) {
-                char who[64];
-                addr_to_text(&clients[idx].addr, who, sizeof(who));
-                printf("[%lld] RX idle from %s id=%s (#%lu)\n",
-                       now, who, id_or_q(hdr.talk_id), clients[idx].rx_idle_packets);
-                fflush(stdout);
-            }
-            continue;
-        }
-
-        if (hdr.type != PKT_AUDIO || len == 0) {
-            char who[64];
-            addr_to_text(&clients[idx].addr, who, sizeof(who));
-            printf("[%lld] unknown packet type=%u flags=0x%02x len=%u from %s id=%s ignored\n",
-                   now, hdr.type, hdr.flags, len, who, id_or_q(hdr.talk_id));
-            fflush(stdout);
-            continue;
-        }
-
-        total_rx_audio++;
-        clients[idx].rx_audio_packets++;
-        clients[idx].last_audio_ms = now;
-        maybe_release_active_talker(clients, &active_talker);
-
-        if (active_talker < 0) {
-            active_talker = idx;
-            char who[64];
-            addr_to_text(&clients[idx].addr, who, sizeof(who));
-            printf("[%lld] active talker granted to %s id=%s%s\n",
-                   now, who, id_or_q(hdr.talk_id),
-                   (hdr.flags & PKT_FLAG_ENCRYPTED) ? " [enc]" : "");
-            fflush(stdout);
-        }
-
-        if (active_talker != idx) {
-            if (clients[idx].rx_audio_packets == 1 || clients[idx].rx_audio_packets % 50 == 0) {
-                char who[64], owner[64];
-                addr_to_text(&clients[idx].addr, who, sizeof(who));
-                addr_to_text(&clients[active_talker].addr, owner, sizeof(owner));
-                printf("[%lld] RX audio from %s id=%s ignored, active talker is %s id=%s\n",
-                       now, who, id_or_q(hdr.talk_id), owner, id_or_q(clients[active_talker].last_talk_id));
-                fflush(stdout);
-            }
-            continue;
-        }
-
-        unsigned long forwarded_this_packet = 0;
+        int idx = -1, free_idx = -1;
         for (int i = 0; i < MAX_CLIENTS; ++i) {
-            if (!clients[i].used || i == idx) {
-                continue;
-            }
-            ssize_t sent = sendto(sock, buf, sizeof(hdr) + len, 0,
-                                  (struct sockaddr *)&clients[i].addr,
-                                  sizeof(clients[i].addr));
-            if (sent >= 0) {
-                clients[i].tx_audio_packets++;
-                total_forwarded++;
-                forwarded_this_packet++;
-            }
+            if (clients[i].used && same_addr(&clients[i].addr, &src)) { idx = i; break; }
+            if (!clients[i].used) free_idx = i;
         }
-
-        if (clients[idx].rx_audio_packets == 1 || clients[idx].rx_audio_packets % 50 == 0) {
-            char who[64];
-            addr_to_text(&clients[idx].addr, who, sizeof(who));
-            printf("[%lld] RX audio from active talker %s id=%s%s (#%lu, %u bytes), forwarded to %lu client(s)\n",
-                   now, who, id_or_q(hdr.talk_id),
-                   (hdr.flags & PKT_FLAG_ENCRYPTED) ? " [enc]" : "",
-                   clients[idx].rx_audio_packets, len, forwarded_this_packet);
-            fflush(stdout);
+        if (idx < 0) {
+            if (free_idx < 0) { rejected++; continue; }
+            idx = free_idx; memset(&clients[idx], 0, sizeof(clients[idx]));
+            clients[idx].used = 1; clients[idx].addr = src;
+        }
+        client_t *c = &clients[idx]; c->last_seen_ms = now;
+        if (hdr.type == PKT_IDLE) continue;
+        if (hdr.type == PKT_AUDIO) { c->rx_audio++; audio++; }
+        if (closed_session(c, hdr.session)) { c->rejected++; rejected++; continue; }
+        if (talker.client == idx && memcmp(talker.session, hdr.session, 16)) {
+            /* New PTT press from the current owner supersedes its previous
+             * session. Remember the old ID so reordered END cannot release it. */
+            if (hdr.type == PKT_AUDIO) release_talker(clients, &talker, "new session");
+            else { c->rejected++; rejected++; continue; }
+        }
+        if (talker.client < 0) {
+            talker.client = idx; talker.ending = 0;
+            memcpy(talker.session, hdr.session, 16);
+            memcpy(talker.talk_id, hdr.talk_id, sizeof(talker.talk_id));
+            talker.last_audio_ms = now;
+            printf("active talker granted: id=%s\n", talker.talk_id); fflush(stdout);
+        }
+        if (talker.client != idx || memcmp(talker.session, hdr.session, 16) ||
+            memcmp(talker.talk_id, hdr.talk_id, sizeof(talker.talk_id))) {
+            if (++c->rejected == 1 || c->rejected % 50 == 0)
+                fprintf(stderr, "audio/control ignored: id=%s active=%s\n", hdr.talk_id, talker.talk_id);
+            rejected++; continue;
+        }
+        if (hdr.type == PKT_END) {
+            if (!talker.ending) {
+                talker.ending = 1; talker.end_seq = ntohl(hdr.seq);
+                talker.release_ms = now + grace;
+            } else if (talker.end_seq != ntohl(hdr.seq)) { invalid++; continue; }
+            /* Duplicate END does not extend the grace period. */
+        } else {
+            if (talker.ending && ptt_seq_diff(ntohl(hdr.seq), talker.end_seq) >= 0) {
+                rejected++; c->rejected++; continue;
+            }
+            talker.last_audio_ms = now;
+        }
+        for (int i = 0; i < MAX_CLIENTS; ++i) {
+            if (!clients[i].used || i == idx) continue;
+            ssize_t sent = sendto(sock, buf, sizeof(hdr) + ntohs(hdr.len), 0,
+                (struct sockaddr *)&clients[i].addr, sizeof(clients[i].addr));
+            if (sent < 0) {
+                if (++send_errors == 1 || send_errors % 50 == 0) perror("forward sendto");
+            } else { forwarded++; c->forwarded++; }
         }
     }
-
-    printf("summary: total_rx_idle=%lu total_rx_audio=%lu total_forwarded=%lu\n",
-           total_rx_idle, total_rx_audio, total_forwarded);
-    for (int i = 0; i < MAX_CLIENTS; ++i) {
-        if (clients[i].used) {
-            char who[64];
-            addr_to_text(&clients[i].addr, who, sizeof(who));
-            printf("client %s id=%s: rx_idle=%lu rx_audio=%lu tx_audio=%lu\n",
-                   who, id_or_q(clients[i].last_talk_id),
-                   clients[i].rx_idle_packets, clients[i].rx_audio_packets, clients[i].tx_audio_packets);
-        }
-    }
-
-    close(sock);
-    return 0;
+    printf("summary: audio=%lu forwarded=%lu rejected=%lu invalid=%lu send_errors=%lu\n", audio, forwarded, rejected, invalid, send_errors);
+    close(sock); return 0;
 }

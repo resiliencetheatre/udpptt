@@ -81,11 +81,13 @@ Black fiber mode does not use `ptt_server`. It is direct client-to-client Layer-
 Packages typically needed on Debian/Ubuntu:
 
 ```sh
-sudo apt install build-essential pkg-config libsodium-dev \
+sudo apt install build-essential pkg-config libsodium-dev libopus-dev \
     libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
     gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
-    gstreamer1.0-plugins-bad gstreamer1.0-tools
+    gstreamer1.0-plugins-bad gstreamer1.0-tools gstreamer1.0-alsa
 ```
+
+GStreamer 1.20 or newer is required for bounded `appsrc` buffering.
 
 ## Installation with `make install`
 
@@ -241,10 +243,142 @@ UDPPTT_KEY='shared room secret' ./ptt_client 198.51.100.10 --txid Bravo --rx-onl
 - A sender never gets its own audio back from the UDP server.
 - In black fiber mode, locally transmitted raw frames may also be visible to the sender’s raw socket, so the client ignores frames whose source MAC address matches its own interface MAC.
 - While the local client is transmitting, it suppresses playback of received audio.
-- In receive mode, incoming audio debug messages show the `talk_id` of the sending party.
+- The optional state file identifies the receiving talker; periodic audio statistics report recovery and playback health.
 - The `--rx-only` and `--no-ptt` options disable keyboard PTT handling and microphone capture, but still keep the client connected for receive/playback.
 - The client can optionally play local `start.wav` and `stop.wav` tones on PTT press/release if those files exist in the current working directory.
 - The `--ptt-socket` option enables external PTT control through a UNIX datagram socket. This is used by `ptt_helper` and `ptt_hid`.
+
+## Protocol v2 and audio recovery
+
+**Upgrade the UDP server and all participating clients together.** Protocol v2
+is intentionally incompatible with the old unversioned packets. There is no
+legacy fallback. Blackfiber peers also need matching v2 clients; Blackfiber
+still does not use a server. Existing PTT controls, audio-device flags, encryption
+passwords, helper/HID commands and state-file fields retain their interfaces.
+
+The shared `ptt_protocol.h` defines a 92-byte header with magic/version, type,
+flags, payload length, frame sample count, sequence number, media timestamp,
+random 128-bit talk-session ID, talker name and encryption nonce. Integers use
+network byte order. Each audio packet represents 960 samples (20 ms at 48 kHz).
+Media timestamps advance by 960 per sequence position, including capture gaps;
+they are relative media time, not wall-clock time. Each PTT press starts a new
+session and sequence. No clock synchronization between computers is required.
+
+When encryption is enabled, the entire header is authenticated as additional
+data. Audio is encrypted after Opus encoding, including its FEC data. Idle and
+end packets also carry authentication tags. The server forwards opaque payloads
+without needing the room password. It cannot verify those tags itself, so its
+talker arbitration continues to trust the packet headers it receives.
+
+### Buffering and FEC options
+
+| Client option | Default | Effect |
+|---|---|---|
+| `--jitter-ms 0..1000` | UDP: 120; Blackfiber: 40 | Initial/refill playout delay. Larger values absorb larger variations in arrival time at the cost of listening delay. |
+| `--fec-loss-percent 0..100` | 10 | Expected packet-loss percentage supplied to the Opus encoder; this is a configured estimate, not measured feedback. |
+| `--no-fec` | FEC enabled | Disables encoder FEC and receiver FEC attempts. Packet-loss concealment and buffering remain enabled. |
+
+For example, an initial configuration to try on a variable mobile link is:
+
+```sh
+./ptt_server --talker-hold-ms 1000 --release-grace-ms 100
+./ptt_client 198.51.100.10 --txid Alpha --jitter-ms 200 --fec-loss-percent 10
+```
+
+Use the same encryption flags/password on participating clients if needed.
+For a predictable Ethernet link, a smaller buffer is appropriate:
+
+```sh
+./ptt_client --blackfiber eth0 --txid Alpha --jitter-ms 40
+```
+
+The buffer is configurable, not adaptive. Choose its delay from observed arrival
+variation rather than ping RTT. Constant 300 ms transit delay does not require a
+300 ms jitter buffer. A value of zero retains sequencing and concealment but
+provides no deliberate waiting for reordering or the next packet's FEC.
+
+The receiver reorders packets and plays one frame per 20 ms on a monotonic local
+schedule. Missing frames use the following buffered Opus packet's FEC when
+available, otherwise Opus packet-loss concealment (PLC). FEC cannot restore an
+arbitrary burst of lost audio. It allocates some encoding capacity to redundancy;
+at the unchanged 24 kbit/s target this can trade voice fidelity for resilience.
+
+Up to eight simultaneous sessions have separate decoders and 128 packet slots
+per session. Blackfiber sessions are mixed with saturation; UDP normally has one
+server-selected talker, although buffered tails may overlap during handover.
+Large sequence jumps trigger a bounded refill. After 300 ms of consecutive
+missing frames, concealment stops and fresh audio starts a refill. Sessions with
+no new packets for two seconds are released. A still-held PTT session may resume
+after an outage. Completed/muted sessions are remembered in a bounded cache to
+reject delayed traffic; this cache is not permanent replay protection.
+
+Pressing local PTT discards queued receive audio and retires those receive
+sessions, preventing stale speech from playing after local transmission ends.
+A remote session heard while muted stays muted for that session (within the
+retirement cache), so a fresh remote PTT press is needed to hear it again.
+Sender capture queues are drained at the start of each PTT session to avoid
+sending microphone audio captured before the press.
+
+### Talker ownership and end-of-talk
+
+| Server option | Default | Effect |
+|---|---|---|
+| `--talker-hold-ms 100..60000` | 1000 | Release ownership after this long without audio arriving. This measures arrival gaps, not transit delay. |
+| `--release-grace-ms 0..2000` | 100 | Allow reordered final audio after an explicit END. Must not exceed the talker hold. |
+
+PTT release sends an END packet three times, with the exclusive final sequence
+number. The receiver drains queued audio through that boundary. The server
+forwards END and accepts the preceding session's delayed tail during the grace
+period; repeated END packets do not extend that period. Increase the grace if
+end-of-talk tails experience more reordering. Lost END packets fall back to the
+server hold timeout and receiver concealment/refill limits. A new PTT session
+from the active sender can supersede its old session immediately.
+
+FEC, END repetition and buffering require no acknowledgement, retransmission or
+return traffic. `--blackfiber-rx-passive` still starts no send thread or capture,
+and `--blackfiber-tx-only` starts no receive/playback thread. These direction flags
+require `--blackfiber`. The server options have no effect on Blackfiber.
+
+### Diagnostics and tests
+
+The client prints `audio stats` every five seconds and at shutdown:
+
+- `decoded`, `missing`, `late`, `duplicate`, `reordered`, `rebuffer`, `timeouts`
+  describe receiver sequencing and playout. `missing` counts playout deadlines
+  without a packet, not proven network loss; a lost END can also produce these.
+- `fec_attempts` counts attempts using the next packet. Opus can fall back to PLC
+  if no redundancy is present; this is **not** a recovered-packet count. `plc`
+  counts explicit concealment calls.
+- `jitter_ms` is a smoothed arrival-spacing deviation across streams, not RTT.
+- `overflow` reports exhausted session capacity; `invalid` and `auth_fail`
+  distinguish malformed/unsupported packets and authentication/mode failures.
+- `queue_drops` counts deliberately dropped PCM blocks when the sound queue is
+  full. `scheduling_late` counts playout-thread delays of at least 20 ms.
+- `audio_errors`, `audio_warnings` and `stream_failed_warnings` accompany detailed
+  GStreamer bus messages from capture/playback. The latter can include audio
+  starvation, but is not a hardware-independent underrun counter. Backend
+  messages provide the actual cause.
+- `capture_gaps` counts missing capture frame positions detected from timestamps.
+  `tx_audio` and `rx_audio` show packet totals. The final `pcm_blocks_queued`
+  includes silence and means accepted into the sound pipeline, not proven heard.
+
+The server reports received audio, forwarded audio/control packets, arbitration
+rejections, invalid packets and forwarding errors every five seconds.
+
+```sh
+make test
+make sanitize
+```
+
+Tests cover deterministic 300 ms transit delay, jitter/reordering, duplicate and
+late packets, FEC/PLC decoding, outages, session isolation, timestamp wrap,
+authenticated header tampering, headless ALSA-null playback/capture, Blackfiber
+frame extraction, and the real UDP server's arbitration and END handling.
+Integration tests require local sockets and the GStreamer ALSA plugin, but no
+microphone, speaker or raw-socket privilege. Sanitizer tests disable leak checking
+for the GStreamer integration process because of process-global library caches;
+address and undefined-behavior checking remain enabled. Physical mobile-network
+and raw-Ethernet/data-diode validation remain deployment checks.
 
 ## PTT input modes
 
@@ -653,7 +787,7 @@ In this mode there is no return path. That means:
 - there is no return audio
 - there is no bidirectional PTT conversation
 - there is no feedback that the receiver heard the audio
-- packet loss cannot be repaired by retransmission
+- packet loss cannot be repaired by retransmission; one-way Opus FEC and PLC remain available
 
 For live voice, this is often acceptable if the one-way Layer-2 path is clean and packet loss is low.
 

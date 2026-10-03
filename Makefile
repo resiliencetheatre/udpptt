@@ -18,23 +18,26 @@ GNOME_EXTENSION_UUID ?= udpptt-indicator@resiliencetheatre.codeberg.org
 GNOME_EXTENSION_SRC ?= gnome-shell-extension/$(GNOME_EXTENSION_UUID)
 GNOME_EXTENSION_DST ?= $(USER_EXTENSIONS_DIR)/$(GNOME_EXTENSION_UUID)
 
-GST_CFLAGS := $(shell pkg-config --cflags gstreamer-1.0 gstreamer-app-1.0 2>/dev/null)
-GST_LIBS   := $(shell pkg-config --libs gstreamer-1.0 gstreamer-app-1.0 2>/dev/null)
+GST_CFLAGS := $(shell pkg-config --cflags gstreamer-1.0 gstreamer-app-1.0 gstreamer-audio-1.0 2>/dev/null)
+GST_LIBS   := $(shell pkg-config --libs gstreamer-1.0 gstreamer-app-1.0 gstreamer-audio-1.0 2>/dev/null)
 SODIUM_CFLAGS := $(shell pkg-config --cflags libsodium 2>/dev/null)
 SODIUM_LIBS   := $(shell pkg-config --libs libsodium 2>/dev/null)
 
-CLIENT_CFLAGS := $(GST_CFLAGS) $(SODIUM_CFLAGS)
-CLIENT_LIBS   := $(GST_LIBS) $(SODIUM_LIBS)
+OPUS_CFLAGS := $(shell pkg-config --cflags opus 2>/dev/null)
+OPUS_LIBS := $(shell pkg-config --libs opus 2>/dev/null)
+
+CLIENT_CFLAGS := $(GST_CFLAGS) $(SODIUM_CFLAGS) $(OPUS_CFLAGS)
+CLIENT_LIBS   := $(GST_LIBS) $(SODIUM_LIBS) $(OPUS_LIBS)
 
 TARGETS = ptt_client ptt_server ptt_helper ptt_hid
 DATAFILES = start.wav stop.wav
 
 all: $(TARGETS)
 
-ptt_client: ptt_client.c
-	$(CC) $(CFLAGS) $(CLIENT_CFLAGS) -o $@ $< $(CLIENT_LIBS)
+ptt_client: ptt_client.c ptt_protocol.h ptt_jitter.h ptt_jitter.c
+	$(CC) $(CFLAGS) $(CLIENT_CFLAGS) -o $@ ptt_client.c ptt_jitter.c $(CLIENT_LIBS)
 
-ptt_server: ptt_server.c
+ptt_server: ptt_server.c ptt_protocol.h
 	$(CC) $(CFLAGS) -o $@ $<
 
 ptt_helper: ptt_helper.c
@@ -228,6 +231,31 @@ uninstall-gnome-extension:
 	@echo "  gnome-extensions disable $(GNOME_EXTENSION_UUID)"
 
 clean:
-	rm -f $(TARGETS)
+	rm -f $(TARGETS) tests/test_recovery tests/test_client tests/test_recovery_sanitize tests/test_client_sanitize tests/ptt_server_sanitize
 
 .PHONY: all install install-gnome-extension uninstall uninstall-gnome-extension clean
+
+TEST_CFLAGS = $(CFLAGS) -Werror -I.
+tests/test_recovery: tests/test_recovery.c ptt_jitter.c ptt_jitter.h ptt_protocol.h
+	$(CC) $(TEST_CFLAGS) $(OPUS_CFLAGS) -o $@ tests/test_recovery.c ptt_jitter.c $(OPUS_LIBS) -lm
+
+tests/test_client: tests/test_client.c ptt_client.c ptt_jitter.c ptt_jitter.h ptt_protocol.h
+	$(CC) $(TEST_CFLAGS) $(CLIENT_CFLAGS) -o $@ tests/test_client.c ptt_jitter.c $(CLIENT_LIBS)
+
+test: all tests/test_recovery tests/test_client
+	./tests/test_recovery
+	./tests/test_client
+	python3 tests/test_server.py
+
+.PHONY: test
+
+SANITIZE_FLAGS = -O1 -g -Wall -Wextra -Werror -pthread -I. -fsanitize=address,undefined -fno-omit-frame-pointer
+sanitize:
+	$(CC) $(SANITIZE_FLAGS) $(OPUS_CFLAGS) -o tests/test_recovery_sanitize tests/test_recovery.c ptt_jitter.c $(OPUS_LIBS) -lm
+	$(CC) $(SANITIZE_FLAGS) $(CLIENT_CFLAGS) -o tests/test_client_sanitize tests/test_client.c ptt_jitter.c $(CLIENT_LIBS)
+	$(CC) $(SANITIZE_FLAGS) -o tests/ptt_server_sanitize ptt_server.c
+	./tests/test_recovery_sanitize
+	ASAN_OPTIONS=detect_leaks=0 ./tests/test_client_sanitize
+	PTT_SERVER=./tests/ptt_server_sanitize python3 tests/test_server.py
+
+.PHONY: sanitize
