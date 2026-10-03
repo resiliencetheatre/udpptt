@@ -380,6 +380,147 @@ for the GStreamer integration process because of process-global library caches;
 address and undefined-behavior checking remain enabled. Physical mobile-network
 and raw-Ethernet/data-diode validation remain deployment checks.
 
+## Testing with tc
+
+Linux `tc netem` can simulate poor connectivity without moving to a mobile
+network. Run the following commands on the **transmitting UDP client** and listen
+on another client. They impair outgoing packets to the PTT server, including
+audio and control packets. They do not impair incoming traffic or Blackfiber.
+The examples require `tc` (the `iproute2` package on Debian/Ubuntu) and `sudo`.
+
+### Select the interface and PTT destination
+
+Use the same shell for setup, profile changes and cleanup. Set the actual server
+IPv4 address and UDP port, then inspect the route:
+
+```sh
+PTT_SERVER=192.0.2.10  # Replace with your actual server IPv4 address
+PTT_PORT=5000
+ip route get "$PTT_SERVER"
+```
+
+Set `PTT_IFACE` to the interface shown after `dev` in that output. All interface
+commands below use this one variable:
+
+```sh
+PTT_IFACE=eth0        # Replace with the interface found above
+tc qdisc show dev "$PTT_IFACE"
+```
+
+If the interface already has custom traffic shaping, preserve its configuration
+and adapt the setup rather than replacing it blindly. If the root setup command
+below reports `File exists`, stop and inspect the existing configuration.
+
+### Set up selective impairment
+
+Create a priority queue with ordinary traffic mapped to its first band. Attach
+netem to the third band and direct only UDP traffic to the selected server/port
+there. SSH and other unmatched traffic stay outside the netem impairment.
+
+```sh
+sudo tc qdisc add dev "$PTT_IFACE" root handle 1: prio bands 3 \
+    priomap 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+
+sudo tc qdisc add dev "$PTT_IFACE" parent 1:3 handle 30: \
+    netem delay 300ms
+
+sudo tc filter add dev "$PTT_IFACE" protocol ip parent 1: prio 1 \
+    flower ip_proto udp dst_ip "$PTT_SERVER" dst_port "$PTT_PORT" \
+    classid 1:3
+```
+
+Proceed only if all setup commands succeed. This configuration changes the root
+queueing hierarchy even though the impairment filter targets only PTT traffic.
+
+### Test profiles
+
+First listen without impairment to establish a baseline. Then test each profile
+individually with sustained speech. Each command below replaces the preceding
+netem profile; do not run them all at once.
+
+```sh
+# 1. Constant delay: continuous audio, with additional conversation delay.
+sudo tc qdisc replace dev "$PTT_IFACE" parent 1:3 handle 30: \
+    netem delay 300ms
+
+# 2. Variable delay: exercise jitter buffering and packet reordering.
+sudo tc qdisc replace dev "$PTT_IFACE" parent 1:3 handle 30: \
+    netem delay 300ms 80ms distribution normal
+
+# 3. Random loss: exercise FEC and packet-loss concealment.
+sudo tc qdisc replace dev "$PTT_IFACE" parent 1:3 handle 30: \
+    netem delay 300ms loss random 5%
+
+# 4. Combined delay variation and loss.
+sudo tc qdisc replace dev "$PTT_IFACE" parent 1:3 handle 30: \
+    netem delay 300ms 80ms distribution normal loss random 5%
+```
+
+The delay is **additional one-way delay on the sender-to-server path**, not ping
+RTT. Large delay variations can also reorder packets. Ordinary ping traffic does
+not match the UDP filter, so ping will not measure this injected delay.
+
+To simulate a half-second outage, hold PTT throughout these commands:
+
+```sh
+sudo tc qdisc replace dev "$PTT_IFACE" parent 1:3 handle 30: \
+    netem loss 100%
+sleep 0.5
+sudo tc qdisc replace dev "$PTT_IFACE" parent 1:3 handle 30: \
+    netem delay 300ms
+```
+
+Expect an audible interruption followed by recovery. FEC cannot reconstruct an
+entire half-second outage. Switching profiles can also disturb queued packets;
+evaluate steady speech after the switch separately from that transition.
+
+### Observe and compare
+
+Inspect the queue and filter counters to confirm that the PTT traffic matches:
+
+```sh
+tc -s qdisc show dev "$PTT_IFACE"
+tc -s filter show dev "$PTT_IFACE" parent 1:
+```
+
+On the receiving client, compare `--jitter-ms 120` with `--jitter-ms 200`. To
+compare FEC enabled versus disabled, restart both sender and receiver with
+`--no-fec` for the disabled run. Keep other settings and the test profile the
+same. Random loss runs will not necessarily drop the same packets.
+
+Watch the receiver's five-second `audio stats` reports:
+
+- Constant delay alone should not cause steadily increasing `missing` or `late`
+  during continuous speech.
+- With jitter, check `reordered`, `late`, `missing` and `rebuffer`. A larger
+  receive buffer can reduce late arrivals at the cost of listening delay.
+- With loss, check `fec_attempts` and `plc`. FEC attempts are not a count of
+  confirmed successful recoveries; listen to the audio as well.
+- Check `queue_drops`, `scheduling_late`, `audio_errors` and `audio_warnings` to
+  distinguish network recovery from local playback problems.
+
+Counters are cumulative for the client process. Compare differences between
+reports, or restart the client between profiles. Unchanged counters while nobody
+is speaking are normal. `jitter_ms` is a smoothed estimate, not a maximum.
+
+### Remove the test configuration
+
+Remove the root hierarchy created for this test, including its filter and netem
+child, then inspect the interface:
+
+```sh
+sudo tc qdisc del dev "$PTT_IFACE" root
+tc qdisc show dev "$PTT_IFACE"
+```
+
+This does not restore any custom queue configuration that was replaced. These
+rules are temporary runtime settings, not persistent interface configuration.
+
+For the underlying commands, see the
+[netem manual](https://man7.org/linux/man-pages/man8/tc-netem.8.html),
+[prio manual](https://man7.org/linux/man-pages/man8/tc-prio.8.html), and
+[flower manual](https://man7.org/linux/man-pages/man8/tc-flower.8.html).
+
 ## PTT input modes
 
 ### PC keyboard mode
