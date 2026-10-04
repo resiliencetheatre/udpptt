@@ -136,6 +136,29 @@ int main(void) {
     h = header(1, 0, PKT_AUDIO);
     uint8_t invalid[] = {0xff};
     assert(!ptt_jitter_put(&j, &h, invalid, sizeof(invalid), 0));
+    /* Decode each telemetry stream before mixing simultaneous talkers. */
+    reset(0);
+    tm_record records[2] = {{.id="ALPHA", .sequence=9}, {.id="BRAVO", .sequence=10, .gps=1, .latitude=4961160, .longitude=613190}};
+    tm_burst bursts[2]; OpusEncoder *encoders[2];
+    for (int i=0;i<2;i++) {
+        assert(tm_build(&bursts[i], &records[i]));
+        encoders[i]=opus_encoder_create(48000,1,OPUS_APPLICATION_VOIP,&err); assert(encoders[i]);
+        opus_encoder_ctl(encoders[i], OPUS_SET_BITRATE(24000));
+    }
+    for (unsigned frame=0;frame<TM_MAX_FRAMES+3;frame++) {
+        for (int i=0;i<2;i++) {
+            tm_frame(&bursts[i], frame, pcm);
+            uint8_t packet[PTT_OPUS_MAX];
+            int bytes=opus_encode(encoders[i],pcm,PTT_SAMPLES,packet,sizeof(packet)); assert(bytes>0);
+            h=header((unsigned)i+1,frame,PKT_AUDIO);
+            assert(ptt_jitter_put(&j,&h,packet,(size_t)bytes,frame*20));
+        }
+        assert(ptt_jitter_render(&j,frame*20,pcm)==2);
+    }
+    assert(j.event_write==2 && j.event_drops==0);
+    assert(!strcmp(j.events[0].id,"ALPHA") && !strcmp(j.events[1].id,"BRAVO"));
+    assert(j.events[1].gps && j.events[1].latitude==4961160);
+    for (int i=0;i<2;i++) opus_encoder_destroy(encoders[i]);
     ptt_jitter_destroy(&j);
     puts("recovery tests passed");
     return 0;

@@ -2,6 +2,7 @@
 #ifndef PTT_JITTER_H
 #define PTT_JITTER_H
 #include "ptt_protocol.h"
+#include "ptt_telemetry.h"
 #include <opus/opus.h>
 #include <stdint.h>
 
@@ -22,6 +23,7 @@ typedef struct {
     int64_t due_ms, last_ms, last_audio_ms;
     unsigned missing_run;
     OpusDecoder *decoder;
+    tm_decoder telemetry;
     ptt_slot_t slots[PTT_SLOTS];
 } ptt_stream_t;
 
@@ -35,6 +37,9 @@ typedef struct {
  * Independent sessions have independent Opus decoders and are mixed locally. */
 typedef struct {
     int delay_ms, fec;
+    tm_record events[16];
+    unsigned event_read, event_write;
+    uint64_t event_drops;
     ptt_stream_t streams[PTT_STREAMS];
     struct { uint8_t session[16]; int64_t until_ms; } retired[64];
     unsigned retired_next;

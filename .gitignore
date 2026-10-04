@@ -8,3 +8,8 @@ tests/test_client
 tests/test_recovery_sanitize
 tests/test_client_sanitize
 tests/ptt_server_sanitize
+
+tests/test_telemetry
+tests/test_telemetry_sanitize
+tools/telemetry_lab
+Speech-Codebook.md

@@ -7,6 +7,8 @@
 #include <gst/app/app.h>
 #include <gst/gst.h>
 #include <gst/audio/audio.h>
+#include <gst/base/gstadapter.h>
+#include <math.h>
 #include <linux/if_ether.h>
 #include <linux/if_packet.h>
 #include <linux/input.h>
@@ -105,6 +107,14 @@ typedef struct {
     unsigned char key[KEY_LEN];
     char alsa_capture_device[ALSA_DEV_MAX];
     char alsa_playback_device[ALSA_DEV_MAX];
+    int preamble_enabled;
+    tm_record telemetry_tx;
+    char gps_file[PATH_MAX];
+    char telemetry_socket[sizeof(((struct sockaddr_un *)0)->sun_path)];
+    int telemetry_fd;
+    atomic_uint playback_quiesced;
+    atomic_int microphone_ready;
+    atomic_int monitor_active;
     int have_start_wav;
     int have_stop_wav;
     char start_wav_path[PATH_MAX];
@@ -468,8 +478,9 @@ static bool send_packet(app_t *app, uint8_t type, const uint8_t *payload, uint16
 static void report_rx_stats(app_t *app) {
     pthread_mutex_lock(&app->jitter_lock);
     ptt_rx_stats_t r = app->jitter.stats;
+    unsigned long long telemetry_drops = app->jitter.event_drops;
     pthread_mutex_unlock(&app->jitter_lock);
-    printf("audio stats: accepted=%llu decoded=%llu missing=%llu fec_attempts=%llu plc=%llu late=%llu duplicate=%llu reordered=%llu invalid=%llu overflow=%llu rebuffer=%llu timeouts=%llu jitter_ms=%.1f suppressed=%lu queue_drops=%lu scheduling_late=%lu audio_errors=%lu audio_warnings=%lu stream_failed_warnings=%lu capture_gaps=%lu tx_audio=%lu rx_audio=%lu auth_fail=%lu\n",
+    printf("audio stats: accepted=%llu decoded=%llu missing=%llu fec_attempts=%llu plc=%llu late=%llu duplicate=%llu reordered=%llu invalid=%llu overflow=%llu rebuffer=%llu timeouts=%llu jitter_ms=%.1f suppressed=%lu queue_drops=%lu scheduling_late=%lu audio_errors=%lu audio_warnings=%lu stream_failed_warnings=%lu capture_gaps=%lu tx_audio=%lu rx_audio=%lu auth_fail=%lu telemetry_drops=%llu\n",
         (unsigned long long)r.accepted, (unsigned long long)r.decoded,
         (unsigned long long)r.missing, (unsigned long long)r.fec_attempts,
         (unsigned long long)r.plc, (unsigned long long)r.late,
@@ -481,7 +492,7 @@ static void report_rx_stats(app_t *app) {
         atomic_load(&app->playback_schedule_late), atomic_load(&app->playback_errors),
         atomic_load(&app->playback_warnings), atomic_load(&app->playback_starvations),
         atomic_load(&app->tx_capture_gaps), atomic_load(&app->tx_audio_packets),
-        atomic_load(&app->rx_audio_packets), atomic_load(&app->rx_decrypt_failures));
+        atomic_load(&app->rx_audio_packets), atomic_load(&app->rx_decrypt_failures), telemetry_drops);
     fflush(stdout);
 }
 
@@ -522,10 +533,22 @@ static void *play_thread_main(void *arg) {
         due += PTT_FRAME_MS;
         int16_t pcm[PTT_SAMPLES] = {0};
         int suppressed = atomic_load(&app->suppress_playback);
+        unsigned suppressed_generation = atomic_load(&app->ptt_generation);
         pthread_mutex_lock(&app->jitter_lock);
         if (suppressed) ptt_jitter_suppress(&app->jitter);
         else ptt_jitter_render(&app->jitter, now, pcm);
         pthread_mutex_unlock(&app->jitter_lock);
+        if (app->preamble_enabled && suppressed) {
+            if (!was_suppressed) gst_element_set_state(app->playback_pipeline, GST_STATE_NULL);
+            atomic_store(&app->playback_quiesced, suppressed_generation);
+            was_suppressed = 1;
+            continue;
+        }
+        if (app->preamble_enabled && was_suppressed && !suppressed) {
+            if (atomic_load(&app->monitor_active)) continue;
+            atomic_store(&app->playback_quiesced, 0);
+            gst_element_set_state(app->playback_pipeline, GST_STATE_PLAYING);
+        }
         if (suppressed && !was_suppressed) {
             /* Discard PCM already queued before pressing local PTT. */
             gst_element_set_state(app->playback_pipeline, GST_STATE_READY);
@@ -575,10 +598,11 @@ static void play_tone_async(app_t *app, const char *path) {
 static void set_ptt_state(app_t *app, int pressed) {
     int old = atomic_exchange(&app->ptt_pressed, pressed); atomic_store(&app->suppress_playback, pressed);
     if (old != pressed) {
+        atomic_store(&app->microphone_ready, 0);
         if (pressed) atomic_fetch_add(&app->ptt_generation, 1);
-        printf("[%lld] PTT %s (txid=%s)\n", now_ms(), pressed ? "DOWN -> sending microphone audio" : "UP -> sending idle frames", app->txid); fflush(stdout);
+        printf("[%lld] PTT %s (txid=%s)\n", now_ms(), pressed ? (app->preamble_enabled ? "DOWN -> preamble; wait for cue to end" : "DOWN -> sending microphone audio") : "UP -> sending idle frames", app->txid); fflush(stdout);
         state_file_set_tx(app, pressed);
-        if (pressed) { if (app->have_start_wav) play_tone_async(app, app->start_wav_path); }
+        if (pressed) { if (!app->preamble_enabled && app->have_start_wav) play_tone_async(app, app->start_wav_path); }
         else { if (app->have_stop_wav) play_tone_async(app, app->stop_wav_path); }
     }
 }
@@ -661,7 +685,10 @@ static void finish_tx_session(app_t *app) {
     for (int i = 0; i < 3; ++i) send_packet(app, PKT_END, NULL, 0);
 }
 
+static void *send_preamble_thread(void *arg);
+
 static void *send_thread_main(void *arg) {
+    if (((app_t *)arg)->preamble_enabled) return send_preamble_thread(arg);
     app_t *app = arg;
     unsigned generation = 0;
     int transmitting = 0;
@@ -713,6 +740,205 @@ static void *send_thread_main(void *arg) {
     }
     if (transmitting) finish_tx_session(app);
     return NULL;
+}
+
+/* Capture PCM only in preamble mode: one libopus encoder handles both sources. */
+static GstElement *make_raw_capture_pipeline(GstElement **sink, const char *device) {
+    char desc[768]; GError *error = NULL;
+    if (device[0]) snprintf(desc, sizeof(desc), "alsasrc device=\"%s\" ! audioconvert ! audioresample ! audio/x-raw,format=%s,channels=1,rate=48000,layout=interleaved ! appsink name=raw sync=false max-buffers=8 drop=true", device, GST_AUDIO_NE(S16));
+    else snprintf(desc, sizeof(desc), "autoaudiosrc ! audioconvert ! audioresample ! audio/x-raw,format=%s,channels=1,rate=48000,layout=interleaved ! appsink name=raw sync=false max-buffers=8 drop=true", GST_AUDIO_NE(S16));
+    GstElement *pipeline = gst_parse_launch(desc, &error);
+    if (!pipeline || error) {
+        fprintf(stderr, "raw capture: %s\n", error ? error->message : "creation failed");
+        if (error) g_error_free(error);
+        if (pipeline) gst_object_unref(pipeline);
+        return NULL;
+    }
+    *sink = gst_bin_get_by_name(GST_BIN(pipeline), "raw");
+    gst_element_set_state(pipeline, GST_STATE_PLAYING);
+    return pipeline;
+}
+
+/* A finite, clocked stream. EOS is delivered by the sink after the cue has
+ * played, rather than when appsrc has merely accepted its final buffer. */
+static GstElement *make_monitor(app_t *app, GstElement **source) {
+    char desc[768]; GError *error = NULL;
+    const char *prefix = "appsrc name=cue format=time is-live=false block=false max-bytes=0 ! audioconvert ! audioresample ! ";
+    if (app->alsa_playback_device[0]) snprintf(desc, sizeof(desc), "%salsasink device=\"%s\" sync=true", prefix, app->alsa_playback_device);
+    else snprintf(desc, sizeof(desc), "%sautoaudiosink sync=true", prefix);
+    GstElement *pipeline = gst_parse_launch(desc, &error);
+    if (!pipeline || error) {
+        fprintf(stderr, "preamble monitor: %s\n", error ? error->message : "creation failed");
+        if (error) g_error_free(error);
+        if (pipeline) gst_object_unref(pipeline);
+        return NULL;
+    }
+    *source = gst_bin_get_by_name(GST_BIN(pipeline), "cue");
+    GstCaps *caps = gst_caps_new_simple("audio/x-raw", "format", G_TYPE_STRING, GST_AUDIO_NE(S16), "layout", G_TYPE_STRING, "interleaved", "rate", G_TYPE_INT, 48000, "channels", G_TYPE_INT, 1, NULL);
+    g_object_set(*source, "caps", caps, NULL); gst_caps_unref(caps);
+    gst_element_set_state(pipeline, GST_STATE_PLAYING);
+    return pipeline;
+}
+
+static void read_fix(app_t *app, tm_record *record) {
+    record->gps = 0;
+    if (!app->gps_file[0]) return;
+    /* Never block on a FIFO/device supplied accidentally as a fix file. */
+    int fd = open(app->gps_file, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return;
+    struct stat st;
+    if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size > 256) { close(fd); return; }
+    char data[257]; ssize_t n = read(fd, data, 256); close(fd);
+    if (n <= 0) return;
+    data[n] = 0;
+    double lat, lon, timestamp; char extra;
+    if (sscanf(data, "%lf %lf %lf %c", &lat, &lon, &timestamp, &extra) != 3 ||
+        !isfinite(lat) || !isfinite(lon) || !isfinite(timestamp) ||
+        lat < -90 || lat > 90 || lon < -180 || lon > 180) return;
+    double age = now_ms() / 1000. - timestamp;
+    if (age < 0 || age > 30) return;
+    record->gps = 1; record->latitude = (int32_t)llround(lat * 100000);
+    record->longitude = (int32_t)llround(lon * 100000); record->age = (uint16_t)ceil(age);
+}
+
+static void drain_capture(app_t *app, GstAdapter *adapter) {
+    gst_adapter_clear(adapter);
+    /* Bounded even for a defective source that produces without pacing. */
+    for (int i = 0; i < 16; i++) {
+        GstSample *sample = gst_app_sink_try_pull_sample(GST_APP_SINK(app->capture_sink), 0);
+        if (!sample) break;
+        gst_sample_unref(sample);
+    }
+}
+
+static void *send_preamble_thread(void *arg) {
+    app_t *app = arg;
+    int error; OpusEncoder *encoder = opus_encoder_create(48000, 1, OPUS_APPLICATION_VOIP, &error);
+    if (!encoder) { fprintf(stderr, "preamble encoder: %s\n", opus_strerror(error)); atomic_store(&app->running, 0); return NULL; }
+    opus_encoder_ctl(encoder, OPUS_SET_BITRATE(24000));
+    opus_encoder_ctl(encoder, OPUS_SET_INBAND_FEC(app->fec_enabled));
+    opus_encoder_ctl(encoder, OPUS_SET_PACKET_LOSS_PERC(app->loss_percent));
+    GstAdapter *adapter = gst_adapter_new();
+    GstElement *monitor = NULL, *source = NULL; GstBus *bus = NULL;
+    tm_burst burst; unsigned frame = 0, generation = 0;
+    int active = 0, failed = 0, eos = 0;
+    int64_t due = mono_ms(), monitor_deadline = 0;
+    GstClockTime capture_end = GST_CLOCK_TIME_NONE;
+    while (atomic_load(&app->running)) {
+        int pressed = atomic_load(&app->ptt_pressed);
+        unsigned current = atomic_load(&app->ptt_generation);
+        if (active && (!pressed || current != generation)) {
+            if (monitor) { gst_element_set_state(monitor, GST_STATE_NULL); gst_object_unref(source); gst_object_unref(bus); gst_object_unref(monitor); monitor = source = NULL; bus = NULL; atomic_store(&app->monitor_active, 0); }
+            finish_tx_session(app); active = 0; atomic_store(&app->microphone_ready, 0);
+        }
+        if (!pressed) { failed = 0; send_packet(app, PKT_IDLE, NULL, 0); atomic_fetch_add(&app->tx_idle_packets, 1); msleep_int(20); continue; }
+        if (failed && current == generation) { msleep_int(10); continue; }
+        if (!active) {
+            /* The playback owner releases the sound device before opening the cue. */
+            if (app->playback_pipeline && atomic_load(&app->playback_quiesced) != current) { msleep_int(5); continue; }
+            tm_record record = app->telemetry_tx; read_fix(app, &record);
+            record.sequence = app->telemetry_tx.sequence++;
+            if (!tm_build(&burst, &record)) { fprintf(stderr, "invalid telemetry record\n"); atomic_store(&app->running, 0); break; }
+            generation = current; failed = 0;
+            atomic_store(&app->monitor_active, 1);
+            monitor = make_monitor(app, &source);
+            if (!monitor) { atomic_store(&app->monitor_active, 0); failed = 1; continue; }
+            bus = gst_element_get_bus(monitor);
+            randombytes_buf(app->tx_session, sizeof(app->tx_session)); app->tx_seq = 0;
+            opus_encoder_ctl(encoder, OPUS_RESET_STATE);
+            drain_capture(app, adapter); capture_end = GST_CLOCK_TIME_NONE;
+            active = 1; frame = 0; eos = 0; due = mono_ms();
+            monitor_deadline = due + burst.frames * 20 + 3000;
+        }
+        int64_t now = mono_ms();
+        if (now < due) { msleep_int((int)(due - now > 5 ? 5 : due - now)); continue; }
+        if (now - due >= 20) due = now;
+        due += 20;
+        int16_t pcm[PTT_SAMPLES] = {0};
+        int is_ready = atomic_load(&app->microphone_ready);
+        if (!is_ready) {
+            if (!eos) drain_capture(app, adapter);
+            if (frame < burst.frames) {
+                tm_frame(&burst, frame, pcm);
+                /* Monitor the audible portion only. The final on-air silence
+                 * lets capture retain speech beginning immediately after EOS. */
+                GstBuffer *buffer = frame < burst.frames - 5 ? gst_buffer_new_allocate(NULL, sizeof(pcm), NULL) : NULL;
+                if (!buffer && frame < burst.frames - 5) { failed = 1; }
+                else if (buffer) {
+                    gst_buffer_fill(buffer, 0, pcm, sizeof(pcm));
+                    GST_BUFFER_PTS(buffer) = frame * 20 * GST_MSECOND;
+                    GST_BUFFER_DURATION(buffer) = 20 * GST_MSECOND;
+                    if (gst_app_src_push_buffer(GST_APP_SRC(source), buffer) != GST_FLOW_OK) failed = 1;
+                }
+                frame++;
+                if (frame == burst.frames - 5 && gst_app_src_end_of_stream(GST_APP_SRC(source)) != GST_FLOW_OK) failed = 1;
+            }
+            GstMessage *message;
+            while ((message = gst_bus_pop_filtered(bus, GST_MESSAGE_EOS | GST_MESSAGE_ERROR))) {
+                if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_ERROR) failed = 1;
+                else eos = 1;
+                gst_message_unref(message);
+            }
+            if (!eos && now >= monitor_deadline) failed = 1;
+            if (failed) {
+                fprintf(stderr, "preamble monitor failed or timed out; release PTT and retry\n");
+                gst_element_set_state(monitor, GST_STATE_NULL); gst_object_unref(source); gst_object_unref(bus); gst_object_unref(monitor); monitor = source = NULL; bus = NULL; atomic_store(&app->monitor_active, 0);
+                finish_tx_session(app); active = 0; continue;
+            }
+            if (eos && frame == burst.frames && atomic_load(&app->ptt_pressed) && generation == atomic_load(&app->ptt_generation)) {
+                gst_element_set_state(monitor, GST_STATE_NULL); gst_object_unref(source); gst_object_unref(bus); gst_object_unref(monitor); monitor = source = NULL; bus = NULL; atomic_store(&app->monitor_active, 0);
+                capture_end = GST_CLOCK_TIME_NONE;
+                atomic_store(&app->microphone_ready, 1);
+                printf("[%lld] PTT READY id=%s (microphone enabled)\n", now_ms(), app->telemetry_tx.id);
+            }
+        } else {
+            /* Accumulate arbitrary capture buffer sizes into 20 ms PCM frames. */
+            while (gst_adapter_available(adapter) < sizeof(pcm)) {
+                GstSample *sample = gst_app_sink_try_pull_sample(GST_APP_SINK(app->capture_sink), 0);
+                if (!sample) break;
+                GstBuffer *buffer = gst_sample_get_buffer(sample);
+                GstClockTime pts = GST_BUFFER_PTS(buffer);
+                if (GST_CLOCK_TIME_IS_VALID(pts) && GST_CLOCK_TIME_IS_VALID(capture_end) && pts > capture_end + 10 * GST_MSECOND) {
+                    gst_adapter_clear(adapter);
+                    atomic_fetch_add(&app->tx_capture_gaps, 1);
+                }
+                capture_end = GST_CLOCK_TIME_IS_VALID(pts) ? pts + gst_util_uint64_scale(gst_buffer_get_size(buffer) / 2, GST_SECOND, 48000) : GST_CLOCK_TIME_NONE;
+                gst_adapter_push(adapter, gst_buffer_ref(buffer)); gst_sample_unref(sample);
+            }
+            if (gst_adapter_available(adapter) >= sizeof(pcm)) {
+                gst_adapter_copy(adapter, pcm, 0, sizeof(pcm)); gst_adapter_flush(adapter, sizeof(pcm));
+            }
+        }
+        if (!atomic_load(&app->ptt_pressed) || generation != atomic_load(&app->ptt_generation)) continue;
+        unsigned char packet[PTT_OPUS_MAX]; int n = opus_encode(encoder, pcm, PTT_SAMPLES, packet, sizeof(packet));
+        if (n > 0 && send_packet(app, PKT_AUDIO, packet, (uint16_t)n)) atomic_fetch_add(&app->tx_audio_packets, 1);
+    }
+    if (monitor) { gst_element_set_state(monitor, GST_STATE_NULL); gst_object_unref(source); gst_object_unref(bus); gst_object_unref(monitor); }
+    atomic_store(&app->monitor_active, 0);
+    if (active) finish_tx_session(app);
+    atomic_store(&app->microphone_ready, 0);
+    g_object_unref(adapter); opus_encoder_destroy(encoder); return NULL;
+}
+
+static void output_telemetry(app_t *app) {
+    for (;;) {
+        tm_record r;
+        pthread_mutex_lock(&app->jitter_lock);
+        int have = app->jitter.event_read != app->jitter.event_write;
+        if (have) r = app->jitter.events[app->jitter.event_read++ % 16];
+        pthread_mutex_unlock(&app->jitter_lock);
+        if (!have) break;
+        char gps[160] = "", json[512];
+        if (r.gps) snprintf(gps, sizeof(gps), ",\"latitude\":%.5f,\"longitude\":%.5f,\"fix_age_s\":%u", r.latitude / 100000., r.longitude / 100000., r.age);
+        snprintf(json, sizeof(json), "{\"type\":\"udpptt.telemetry\",\"version\":1,\"received_at_ms\":%lld,\"id\":\"%s\",\"sequence\":%u,\"gps\":%s%s}", now_ms(), r.id, r.sequence, r.gps ? "true" : "false", gps);
+        printf("TELEMETRY %s\n", json); fflush(stdout);
+        if (app->telemetry_fd >= 0 && app->telemetry_socket[0]) {
+            struct sockaddr_un address = {.sun_family = AF_UNIX};
+            snprintf(address.sun_path, sizeof(address.sun_path), "%s", app->telemetry_socket);
+            if (sendto(app->telemetry_fd, json, strlen(json), MSG_DONTWAIT | MSG_NOSIGNAL, (struct sockaddr *)&address, sizeof(address)) < 0)
+                fprintf(stderr, "telemetry event delivery: %s\n", strerror(errno));
+        }
+    }
 }
 
 static ssize_t recv_transport_packet(app_t *app, uint8_t *buf, size_t buf_sz) {
@@ -800,6 +1026,7 @@ static void cleanup(app_t *app) {
     ptt_jitter_destroy(&app->jitter);
     if (app->capture_pipeline) { gst_element_set_state(app->capture_pipeline, GST_STATE_NULL); if (app->capture_sink) gst_object_unref(app->capture_sink); gst_object_unref(app->capture_pipeline); }
     if (app->playback_pipeline) { gst_element_set_state(app->playback_pipeline, GST_STATE_NULL); if (app->playback_src) { gst_app_src_end_of_stream(GST_APP_SRC(app->playback_src)); gst_object_unref(app->playback_src); } gst_object_unref(app->playback_pipeline); }
+    if (app->telemetry_fd >= 0) { close(app->telemetry_fd); app->telemetry_fd = -1; }
     if (app->sock >= 0) { close(app->sock); app->sock = -1; }
     if (app->state_file_enabled) state_file_write_idle(app);
     if (app->ptt_socket_enabled && app->ptt_socket_path[0]) unlink(app->ptt_socket_path);
@@ -815,16 +1042,31 @@ static void usage(const char *argv0) {
             "       [--codec-ptt] [--ptt-socket PATH] [--state-file PATH] [--rx-state-timeout-ms MS]\n"
             "       [--altgr-ptt-delay-ms MS] [--rpi-audio]\n"
             "       [--alsa-device DEV] [--alsa-capture-device DEV] [--alsa-playback-device DEV]\n"
+            "       [--preamble-id ABCDE] [--gps-file PATH] [--telemetry-socket PATH]\n"
             "       [--jitter-ms 0..1000] [--fec-loss-percent 0..100] [--no-fec]\n"
             "       [--blackfiber IFACE] [--bf-dst-mac MAC] [--bf-ethertype ETHERTYPE]\n"
             "       [--blackfiber-rx-passive] [--blackfiber-tx-only]\n", argv0);
 }
 
 int main(int argc, char **argv) {
-    memset(&g_app, 0, sizeof(g_app)); pthread_mutex_init(&g_app.state_lock, NULL); pthread_mutex_init(&g_app.jitter_lock, NULL); g_app.jitter_ms = -1; g_app.loss_percent = 10; g_app.fec_enabled = 1; g_app.sock = -1; g_app.ptt_ctrl_sock = -1; g_app.server_port = DEFAULT_SERVER_PORT; g_app.transport_mode = TRANSPORT_UDP; g_app.ptt_enabled = 1; g_app.pc_ptt_hold_ms = 2000; g_app.rx_state_timeout_ms = 1000; g_app.bf_ethertype = DEFAULT_BLACKFIBER_ETHERTYPE; memset(g_app.bf_dst_mac, 0xff, sizeof(g_app.bf_dst_mac)); snprintf(g_app.txid, sizeof(g_app.txid), "anon");
+    memset(&g_app, 0, sizeof(g_app)); pthread_mutex_init(&g_app.state_lock, NULL); pthread_mutex_init(&g_app.jitter_lock, NULL); g_app.jitter_ms = -1; g_app.loss_percent = 10; g_app.fec_enabled = 1; g_app.telemetry_fd = -1; g_app.sock = -1; g_app.ptt_ctrl_sock = -1; g_app.server_port = DEFAULT_SERVER_PORT; g_app.transport_mode = TRANSPORT_UDP; g_app.ptt_enabled = 1; g_app.pc_ptt_hold_ms = 2000; g_app.rx_state_timeout_ms = 1000; g_app.bf_ethertype = DEFAULT_BLACKFIBER_ETHERTYPE; memset(g_app.bf_dst_mac, 0xff, sizeof(g_app.bf_dst_mac)); snprintf(g_app.txid, sizeof(g_app.txid), "anon");
     const char *server_ip = NULL; const char *password = NULL;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--rx-only") || !strcmp(argv[i], "--no-ptt")) g_app.ptt_enabled = 0;
+        else if (!strcmp(argv[i], "--preamble-id")) {
+            if (i + 1 >= argc || !tm_id(g_app.telemetry_tx.id, argv[++i])) {
+                fprintf(stderr, "--preamble-id requires exactly five letters A-Z\n"); return 1;
+            }
+            g_app.preamble_enabled = 1;
+        }
+        else if (!strcmp(argv[i], "--gps-file")) {
+            if (i + 1 >= argc || !argv[i+1][0] || strlen(argv[i+1]) >= sizeof(g_app.gps_file)) return 1;
+            copy_opt_string(g_app.gps_file, sizeof(g_app.gps_file), argv[++i]);
+        }
+        else if (!strcmp(argv[i], "--telemetry-socket")) {
+            if (i + 1 >= argc || !argv[i+1][0] || strlen(argv[i+1]) >= sizeof(g_app.telemetry_socket)) return 1;
+            copy_opt_string(g_app.telemetry_socket, sizeof(g_app.telemetry_socket), argv[++i]);
+        }
         else if (!strcmp(argv[i], "--no-fec")) g_app.fec_enabled = 0;
         else if (!strcmp(argv[i], "--jitter-ms") || !strcmp(argv[i], "--fec-loss-percent")) {
             int jitter = !strcmp(argv[i], "--jitter-ms");
@@ -874,6 +1116,11 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (g_app.gps_file[0] && !g_app.preamble_enabled) { fprintf(stderr, "--gps-file requires --preamble-id\n"); return 1; }
+    if (g_app.telemetry_socket[0]) {
+        g_app.telemetry_fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        if (g_app.telemetry_fd < 0) { perror("telemetry socket"); return 1; }
+    }
     if (g_app.jitter_ms < 0) g_app.jitter_ms = g_app.transport_mode == TRANSPORT_UDP ? 120 : 40;
     ptt_jitter_init(&g_app.jitter, g_app.jitter_ms, g_app.fec_enabled);
     if (g_app.ptt_socket_enabled && !g_app.ptt_socket_path[0]) { fprintf(stderr, "--ptt-socket requires a non-empty path\n"); return 1; }
@@ -890,7 +1137,7 @@ int main(int argc, char **argv) {
     }
 
     if (g_app.ptt_socket_enabled) { g_app.ptt_ctrl_sock = make_ptt_control_socket(g_app.ptt_socket_path); if (g_app.ptt_ctrl_sock < 0) { cleanup(&g_app); return 1; } }
-    if (g_app.ptt_enabled) { g_app.capture_pipeline = make_capture_pipeline(&g_app.capture_sink, g_app.alsa_capture_device, g_app.fec_enabled, g_app.loss_percent); if (!g_app.capture_pipeline) { cleanup(&g_app); return 1; } }
+    if (g_app.ptt_enabled) { g_app.capture_pipeline = g_app.preamble_enabled ? make_raw_capture_pipeline(&g_app.capture_sink, g_app.alsa_capture_device) : make_capture_pipeline(&g_app.capture_sink, g_app.alsa_capture_device, g_app.fec_enabled, g_app.loss_percent); if (!g_app.capture_pipeline) { cleanup(&g_app); return 1; } }
     if (!g_app.blackfiber_tx_only) {
         g_app.playback_pipeline = make_playback_pipeline(&g_app.playback_src, g_app.alsa_playback_device);
         if (!g_app.playback_pipeline) { cleanup(&g_app); return 1; }
@@ -944,6 +1191,7 @@ int main(int argc, char **argv) {
     }
     int64_t next_report = mono_ms() + 5000;
     while (atomic_load(&g_app.running)) {
+        output_telemetry(&g_app);
         check_audio_bus(&g_app, g_app.capture_pipeline);
         if (mono_ms() >= next_report) { report_rx_stats(&g_app); next_report = mono_ms() + 5000; }
         msleep_int(100);

@@ -1310,3 +1310,15 @@ GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License
 along with this project. If not, see <https://www.gnu.org/licenses/>.
+
+### Experimental ID/GPS audio preamble
+
+Use `--preamble-id ALPHA` to replace `start.wav` with a locally audible telemetry
+burst on every PTT press. Speak when its final cue ends. The burst carries a
+five-letter ID and, with `--gps-file PATH`, an optional fresh position. Receivers
+print validated `TELEMETRY` records and can send JSON to `--telemetry-socket PATH`.
+Audio remains intact for downstream bridges. ID-only bursts are 1.42 seconds;
+GPS bursts are 2.22 seconds, before additional device latency.
+
+See [audio preamble usage, protocol and validation](docs/audio-preamble.md) for
+GPS input, event format, reproducible experiments and current limitations.

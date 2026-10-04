@@ -22,6 +22,8 @@ int main(int argc, char **argv) {
     gst_init(&argc, &argv); assert(sodium_init() >= 0);
     app_t *tx = calloc(1, sizeof(*tx)), *rx = calloc(1, sizeof(*rx));
     assert(tx && rx);
+    pthread_mutex_init(&tx->jitter_lock, NULL);
+    pthread_mutex_init(&tx->state_lock, NULL);
     pthread_mutex_init(&rx->jitter_lock, NULL);
     pthread_mutex_init(&rx->state_lock, NULL);
     ptt_jitter_init(&rx->jitter, 60, 1);
@@ -123,6 +125,81 @@ int main(int argc, char **argv) {
     atomic_store(&tx->running, 0); pthread_join(tx->send_thread, NULL);
     gst_element_set_state(capture, GST_STATE_NULL);
     gst_object_unref(capture_sink); gst_object_unref(capture);
+
+    /* GPS is an atomic snapshot file; missing/stale/malformed fixes fall back
+     * to ID only rather than emitting a fabricated coordinate. */
+    char fix_path[] = "/tmp/udpptt-fix-XXXXXX"; int fix_fd = mkstemp(fix_path); assert(fix_fd >= 0);
+    snprintf(tx->gps_file, sizeof(tx->gps_file), "%s", fix_path);
+    char fix_text[128]; int fix_len = snprintf(fix_text, sizeof(fix_text), "49.61160 6.13190 %.3f\n", now_ms()/1000. - 2);
+    assert(write(fix_fd, fix_text, (size_t)fix_len) == fix_len);
+    tm_record fix_record = {0}; read_fix(tx, &fix_record);
+    assert(fix_record.gps && fix_record.latitude == 4961160 && fix_record.longitude == 613190 && fix_record.age >= 2);
+    assert(ftruncate(fix_fd, 0) == 0); assert(lseek(fix_fd, 0, SEEK_SET) == 0);
+    assert(write(fix_fd, "0 0 1\n", 6) == 6); read_fix(tx, &fix_record); assert(!fix_record.gps);
+    close(fix_fd); unlink(fix_path); tx->gps_file[0] = 0;
+
+    /* Machine-readable events use a separate nonblocking datagram socket. */
+    char event_dir[] = "/tmp/udpptt-events-XXXXXX"; assert(mkdtemp(event_dir));
+    struct sockaddr_un event_address = {.sun_family = AF_UNIX};
+    snprintf(event_address.sun_path, sizeof(event_address.sun_path), "%s/listener", event_dir);
+    int event_listener = socket(AF_UNIX, SOCK_DGRAM, 0); assert(event_listener >= 0);
+    assert(bind(event_listener, (struct sockaddr *)&event_address, sizeof(event_address)) == 0);
+    assert(setsockopt(event_listener, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
+    rx->telemetry_fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK, 0); assert(rx->telemetry_fd >= 0);
+    snprintf(rx->telemetry_socket, sizeof(rx->telemetry_socket), "%s", event_address.sun_path);
+    rx->jitter.events[rx->jitter.event_write++ % 16] = (tm_record){.id="ALPHA", .sequence=17, .gps=1, .latitude=4961160, .longitude=613190, .age=2};
+    output_telemetry(rx);
+    char event_json[512]; n = recv(event_listener, event_json, sizeof(event_json)-1, 0); assert(n > 0); event_json[n] = 0;
+    assert(strstr(event_json, "\"id\":\"ALPHA\"") && strstr(event_json, "\"latitude\":49.61160"));
+    assert(rx->jitter.event_read == rx->jitter.event_write);
+    close(rx->telemetry_fd); rx->telemetry_fd = -1; close(event_listener);
+    unlink(event_address.sun_path); rmdir(event_dir);
+
+    /* Preamble uses the real sender/encoder and clocked local monitor. Verify
+     * early release, a new burst on re-press, CRC-decoded audio and ready gate. */
+    tx->preamble_enabled = 1; assert(tm_id(tx->telemetry_tx.id, "ALPHA"));
+    snprintf(tx->alsa_playback_device, sizeof(tx->alsa_playback_device), "null");
+    tx->capture_pipeline = make_raw_capture_pipeline(&tx->capture_sink, "null");
+    tx->playback_pipeline = make_playback_pipeline(&tx->playback_src, "null");
+    assert(tx->capture_pipeline && tx->playback_pipeline);
+    ptt_jitter_init(&tx->jitter, 40, 1);
+    atomic_store(&tx->running, 1);
+    assert(pthread_create(&tx->play_thread, NULL, play_thread_main, tx) == 0);
+    assert(pthread_create(&tx->send_thread, NULL, send_thread_main, tx) == 0);
+    set_ptt_state(tx, 1);
+    first = wait_type(pair[1], PKT_AUDIO);
+    assert(ntohl(first.seq) == 0 && !atomic_load(&tx->microphone_ready));
+    set_ptt_state(tx, 0); wait_type(pair[1], PKT_END);
+    assert(!atomic_load(&tx->microphone_ready));
+    set_ptt_state(tx, 1);
+    tm_decoder telemetry = {0}; tm_record event = {0}; int events = 0, decode_error;
+    OpusDecoder *wire_decoder = opus_decoder_create(48000, 1, &decode_error); assert(wire_decoder);
+    int64_t started = mono_ms(), deadline = started + 6000;
+    while (mono_ms() < deadline) {
+        n = recv(pair[1], wire, sizeof(wire), 0);
+        if (n < 0) continue;
+        memcpy(&h, wire, sizeof(h));
+        if (h.type != PKT_AUDIO) continue;
+        assert(crypto_aead_xchacha20poly1305_ietf_decrypt(plain, &len, NULL,
+            wire + sizeof(h), ntohs(h.len), (unsigned char *)&h, sizeof(h), h.nonce, tx->key) == 0);
+        int16_t decoded_pcm[PTT_SAMPLES];
+        assert(opus_decode(wire_decoder, plain, (opus_int32)len, decoded_pcm, PTT_SAMPLES, 0) == PTT_SAMPLES);
+        events += tm_receive(&telemetry, decoded_pcm, PTT_SAMPLES, &event);
+        if (atomic_load(&tx->microphone_ready)) break;
+    }
+    assert(atomic_load(&tx->microphone_ready));
+    assert(mono_ms() - started >= 1400); /* 71 frames plus sink drain/guard */
+    assert(events == 1 && !strcmp(event.id, "ALPHA"));
+    set_ptt_state(tx, 0); wait_type(pair[1], PKT_END);
+    atomic_store(&tx->running, 0);
+    pthread_join(tx->send_thread, NULL); pthread_join(tx->play_thread, NULL);
+    opus_decoder_destroy(wire_decoder);
+    gst_element_set_state(tx->capture_pipeline, GST_STATE_NULL);
+    gst_object_unref(tx->capture_sink); gst_object_unref(tx->capture_pipeline);
+    gst_element_set_state(tx->playback_pipeline, GST_STATE_NULL);
+    gst_object_unref(tx->playback_src); gst_object_unref(tx->playback_pipeline);
+    ptt_jitter_destroy(&tx->jitter);
+    pthread_mutex_destroy(&tx->jitter_lock); pthread_mutex_destroy(&tx->state_lock);
 
     /* Exercise the actual PCM playback pipeline with ALSA's null device. */
     rx->playback_pipeline = make_playback_pipeline(&rx->playback_src, "null");

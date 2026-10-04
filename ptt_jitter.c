@@ -99,6 +99,7 @@ int ptt_jitter_put(ptt_jitter_t *j, const packet_hdr_t *h,
         /* Bound both memory and latency after an outage or scheduler stall. */
         memset(s->slots, 0, sizeof(s->slots));
         opus_decoder_ctl(s->decoder, OPUS_RESET_STATE);
+        tm_decoder_reset(&s->telemetry);
         s->next = s->highest = seq;
         s->due_ms = now + j->delay_ms;
         s->started = 0;
@@ -168,6 +169,12 @@ unsigned ptt_jitter_render(ptt_jitter_t *j, int64_t now, int16_t pcm[PTT_SAMPLES
             j->stats.plc++;
             if (n != PTT_SAMPLES) memset(decoded, 0, sizeof(decoded));
         }
+        tm_record event;
+        if (tm_receive(&s->telemetry, decoded, PTT_SAMPLES, &event)) {
+            if (j->event_write - j->event_read < 16)
+                j->events[j->event_write++ % 16] = event;
+            else j->event_drops++;
+        }
         for (int k = 0; k < PTT_SAMPLES; ++k) mixed[k] += decoded[k];
         rendered++;
         s->next++;
@@ -194,6 +201,7 @@ unsigned ptt_jitter_render(ptt_jitter_t *j, int64_t now, int16_t pcm[PTT_SAMPLES
                 s->rebuffer = s->started = 0; s->missing_run = 0;
             }
             opus_decoder_ctl(s->decoder, OPUS_RESET_STATE);
+        tm_decoder_reset(&s->telemetry);
             j->stats.rebuffered++;
         }
     }

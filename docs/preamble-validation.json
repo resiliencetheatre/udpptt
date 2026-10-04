@@ -1,0 +1,72 @@
+{
+  "date": "2026-10-04",
+  "config": {
+    "seed": 20261004,
+    "count_per_loss_rate": 24,
+    "loss_percent": [
+      0,
+      2,
+      5
+    ],
+    "sample_rate": 48000,
+    "symbol_ms": 20,
+    "pitches_hz": [
+      100,
+      110,
+      120,
+      130,
+      140,
+      150,
+      160,
+      170,
+      180,
+      190,
+      200,
+      210,
+      220,
+      230,
+      240,
+      250
+    ],
+    "codec": "libopus VOIP, 24000 bps, FEC on, expected loss 10%; receiver PLC",
+    "waveform": "harmonics 2..12, Gaussian envelopes at 700 and 1400 Hz",
+    "fec": "K7 rate 1/2 (171,133 octal), hard Viterbi, four-row interleave",
+    "sources_sha256": {
+      "ptt_telemetry.c": "aafc1b4a2b1fa29dbade4b2f725953ca192bb06e5296aec8656dc9c39e9db73b",
+      "ptt_telemetry.h": "02d932660e07e9fdf03ca65db037e53871b174284f05e327ba3cbc8ef4e67161",
+      "tools/telemetry_lab.c": "ff9f65d5cb6bba81bd1c6c7f40beebdd05a0214ed0d361186917464b44413c08"
+    }
+  },
+  "burst_results": [
+    {
+      "loss_percent": 0,
+      "trials": 24,
+      "correct_bursts": 24,
+      "received_events": 24,
+      "incorrect_events": 0
+    },
+    {
+      "loss_percent": 2,
+      "trials": 24,
+      "correct_bursts": 23,
+      "received_events": 23,
+      "incorrect_events": 0
+    },
+    {
+      "loss_percent": 5,
+      "trials": 24,
+      "correct_bursts": 20,
+      "received_events": 20,
+      "incorrect_events": 0
+    }
+  ],
+  "symbol_confusion": {
+    "symbols": 512,
+    "raw_errors": 0,
+    "opus_errors": 13,
+    "opus_lookahead_samples": 312
+  },
+  "ffprobe_validated_wav_files": 146,
+  "scope": "Synthetic PCM and single Opus pass; no AMR-WB, physical audio devices or external voice bridges tested.",
+  "libopus_version": "1.5.2"
+}

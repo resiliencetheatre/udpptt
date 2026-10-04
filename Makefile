@@ -34,8 +34,8 @@ DATAFILES = start.wav stop.wav
 
 all: $(TARGETS)
 
-ptt_client: ptt_client.c ptt_protocol.h ptt_jitter.h ptt_jitter.c
-	$(CC) $(CFLAGS) $(CLIENT_CFLAGS) -o $@ ptt_client.c ptt_jitter.c $(CLIENT_LIBS)
+ptt_client: ptt_client.c ptt_protocol.h ptt_jitter.h ptt_telemetry.h ptt_jitter.c ptt_telemetry.c
+	$(CC) $(CFLAGS) $(CLIENT_CFLAGS) -o $@ ptt_client.c ptt_jitter.c ptt_telemetry.c $(CLIENT_LIBS) -lm
 
 ptt_server: ptt_server.c ptt_protocol.h
 	$(CC) $(CFLAGS) -o $@ $<
@@ -231,18 +231,22 @@ uninstall-gnome-extension:
 	@echo "  gnome-extensions disable $(GNOME_EXTENSION_UUID)"
 
 clean:
-	rm -f $(TARGETS) tests/test_recovery tests/test_client tests/test_recovery_sanitize tests/test_client_sanitize tests/ptt_server_sanitize
+	rm -f $(TARGETS) tests/test_telemetry tests/test_telemetry_sanitize tools/telemetry_lab tests/test_recovery tests/test_client tests/test_recovery_sanitize tests/test_client_sanitize tests/ptt_server_sanitize
 
 .PHONY: all install install-gnome-extension uninstall uninstall-gnome-extension clean
 
 TEST_CFLAGS = $(CFLAGS) -Werror -I.
-tests/test_recovery: tests/test_recovery.c ptt_jitter.c ptt_jitter.h ptt_protocol.h
-	$(CC) $(TEST_CFLAGS) $(OPUS_CFLAGS) -o $@ tests/test_recovery.c ptt_jitter.c $(OPUS_LIBS) -lm
+tests/test_recovery: tests/test_recovery.c ptt_jitter.c ptt_telemetry.c ptt_jitter.h ptt_telemetry.h ptt_protocol.h
+	$(CC) $(TEST_CFLAGS) $(OPUS_CFLAGS) -o $@ tests/test_recovery.c ptt_jitter.c ptt_telemetry.c $(OPUS_LIBS) -lm
 
-tests/test_client: tests/test_client.c ptt_client.c ptt_jitter.c ptt_jitter.h ptt_protocol.h
-	$(CC) $(TEST_CFLAGS) $(CLIENT_CFLAGS) -o $@ tests/test_client.c ptt_jitter.c $(CLIENT_LIBS)
+tests/test_client: tests/test_client.c ptt_client.c ptt_jitter.c ptt_telemetry.c ptt_jitter.h ptt_telemetry.h ptt_protocol.h
+	$(CC) $(TEST_CFLAGS) $(CLIENT_CFLAGS) -o $@ tests/test_client.c ptt_jitter.c ptt_telemetry.c $(CLIENT_LIBS) -lm
 
-test: all tests/test_recovery tests/test_client
+tests/test_telemetry: tests/test_telemetry.c ptt_telemetry.c ptt_telemetry.h
+	$(CC) $(TEST_CFLAGS) $(OPUS_CFLAGS) -o $@ tests/test_telemetry.c ptt_telemetry.c $(OPUS_LIBS) -lm
+
+test: all tests/test_recovery tests/test_client tests/test_telemetry
+	./tests/test_telemetry
 	./tests/test_recovery
 	./tests/test_client
 	python3 tests/test_server.py
@@ -251,11 +255,16 @@ test: all tests/test_recovery tests/test_client
 
 SANITIZE_FLAGS = -O1 -g -Wall -Wextra -Werror -pthread -I. -fsanitize=address,undefined -fno-omit-frame-pointer
 sanitize:
-	$(CC) $(SANITIZE_FLAGS) $(OPUS_CFLAGS) -o tests/test_recovery_sanitize tests/test_recovery.c ptt_jitter.c $(OPUS_LIBS) -lm
-	$(CC) $(SANITIZE_FLAGS) $(CLIENT_CFLAGS) -o tests/test_client_sanitize tests/test_client.c ptt_jitter.c $(CLIENT_LIBS)
+	$(CC) $(SANITIZE_FLAGS) $(OPUS_CFLAGS) -o tests/test_telemetry_sanitize tests/test_telemetry.c ptt_telemetry.c $(OPUS_LIBS) -lm
+	./tests/test_telemetry_sanitize
+	$(CC) $(SANITIZE_FLAGS) $(OPUS_CFLAGS) -o tests/test_recovery_sanitize tests/test_recovery.c ptt_jitter.c ptt_telemetry.c $(OPUS_LIBS) -lm
+	$(CC) $(SANITIZE_FLAGS) $(CLIENT_CFLAGS) -o tests/test_client_sanitize tests/test_client.c ptt_jitter.c ptt_telemetry.c $(CLIENT_LIBS) -lm
 	$(CC) $(SANITIZE_FLAGS) -o tests/ptt_server_sanitize ptt_server.c
 	./tests/test_recovery_sanitize
 	ASAN_OPTIONS=detect_leaks=0 ./tests/test_client_sanitize
 	PTT_SERVER=./tests/ptt_server_sanitize python3 tests/test_server.py
 
 .PHONY: sanitize
+
+tools/telemetry_lab: tools/telemetry_lab.c ptt_telemetry.c ptt_telemetry.h
+	$(CC) $(TEST_CFLAGS) $(OPUS_CFLAGS) -o $@ tools/telemetry_lab.c ptt_telemetry.c $(OPUS_LIBS) -lm
