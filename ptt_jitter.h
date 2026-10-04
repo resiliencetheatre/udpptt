@@ -51,5 +51,13 @@ void ptt_jitter_destroy(ptt_jitter_t *j);
 void ptt_jitter_suppress(ptt_jitter_t *j);
 int ptt_jitter_put(ptt_jitter_t *j, const packet_hdr_t *h,
                    const uint8_t *data, size_t len, int64_t now);
+/* Optional per-session PCM tap. Called under the caller's serialization; the
+ * callback must not block or retain the PCM pointer. The mixed output and
+ * recovery behavior are identical to ptt_jitter_render. */
+typedef void (*ptt_pcm_callback)(void *context, unsigned slot,
+                                 const int16_t pcm[PTT_SAMPLES]);
+unsigned ptt_jitter_render_each(ptt_jitter_t *j, int64_t now,
+                               int16_t pcm[PTT_SAMPLES],
+                               ptt_pcm_callback callback, void *context);
 unsigned ptt_jitter_render(ptt_jitter_t *j, int64_t now, int16_t pcm[PTT_SAMPLES]);
 #endif

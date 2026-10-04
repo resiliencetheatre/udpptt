@@ -125,7 +125,8 @@ int ptt_jitter_put(ptt_jitter_t *j, const packet_hdr_t *h,
     return 1;
 }
 
-unsigned ptt_jitter_render(ptt_jitter_t *j, int64_t now, int16_t pcm[PTT_SAMPLES]) {
+unsigned ptt_jitter_render_each(ptt_jitter_t *j, int64_t now, int16_t pcm[PTT_SAMPLES],
+                               ptt_pcm_callback callback, void *context) {
     int32_t mixed[PTT_SAMPLES] = {0};
     unsigned rendered = 0;
     for (int i = 0; i < PTT_STREAMS; ++i) {
@@ -169,6 +170,7 @@ unsigned ptt_jitter_render(ptt_jitter_t *j, int64_t now, int16_t pcm[PTT_SAMPLES
             j->stats.plc++;
             if (n != PTT_SAMPLES) memset(decoded, 0, sizeof(decoded));
         }
+        if (callback) callback(context, (unsigned)i, decoded);
         tm_record event;
         if (tm_receive(&s->telemetry, decoded, PTT_SAMPLES, &event)) {
             if (j->event_write - j->event_read < 16)
@@ -210,4 +212,8 @@ unsigned ptt_jitter_render(ptt_jitter_t *j, int64_t now, int16_t pcm[PTT_SAMPLES
         pcm[k] = v > INT16_MAX ? INT16_MAX : v < INT16_MIN ? INT16_MIN : (int16_t)v;
     }
     return rendered;
+}
+
+unsigned ptt_jitter_render(ptt_jitter_t *j, int64_t now, int16_t pcm[PTT_SAMPLES]) {
+    return ptt_jitter_render_each(j, now, pcm, NULL, NULL);
 }

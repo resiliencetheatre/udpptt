@@ -7,6 +7,106 @@ Simple UDP push-to-talk audio test program using a client/server model.
 `udpptt` can also be used in a raw Ethernet "black fiber" mode, where clients exchange audio frames directly over a local Ethernet interface without IP addressing, routing, DHCP, or a UDP server.
 
 
+## WAV file gateway
+
+`ptt_wav_gate` uses WAV files in place of the client's PTT button, microphone,
+and speaker. It does not launch Kokoro, whisper.cpp, or any other external
+binary. Build it with `make ptt_wav_gate` (also included in `make` and the install
+and uninstall targets). It uses the same GStreamer, Opus, and libsodium dependencies
+as the client, including the GStreamer `wavparse`, `audioconvert`, and
+`audioresample` plugins. No audio hardware or desktop session is required.
+
+```sh
+./ptt_wav_gate 127.0.0.1 --port 5000 --txid WavGate \
+    --input-dir ./outgoing --output-dir ./incoming
+```
+
+Run `ptt_server` at the specified address and connect other clients as usual.
+The gateway creates `outgoing`, `outgoing/sent`, and `incoming` if needed (their
+parents must exist). Input and output must be different directories; one gateway
+may own a given input directory at a time.
+
+Write each complete WAV under a temporary name, close it, then rename it into
+the input directory with a `.wav` filename. When reusing a filename, wait until
+the previous input has moved to `sent/` before publishing the next one:
+
+```sh
+cp /path/to/generated.wav ./outgoing/.speech.tmp
+mv ./outgoing/.speech.tmp ./outgoing/speech.wav
+```
+
+The gateway scans every 250 ms, including files already present at startup. It
+considers regular, non-hidden `.wav` files in filename order after their size and
+modification metadata have remained stable for one second. Symlinks and
+subdirectories are ignored. The stability interval is a convenience, not a
+producer-completion guarantee: use the temporary-file-and-rename pattern above,
+and do not edit or replace published input files while they are queued.
+
+Supported RIFF/WAVE input is decoded with GStreamer and converted to 48 kHz mono
+PCM before transmission; ordinary PCM16 WAVs at 16, 24, 44.1, or 48 kHz and
+mono/stereo are suitable. The decoded snapshot is stored in a temporary disk file,
+so memory does not grow with recording length. Transmission uses the client's
+24 kbit/s Opus codec and real-time 20 ms frames; the final short frame is padded
+with silence. Each input file becomes a new PTT session. Malformed, empty, and
+truncated WAVs remain in place and are skipped until modified or the gateway is
+restarted, without blocking other queued files.
+
+After all audio and three END packets have been successfully sent, the original
+file moves to `outgoing/sent/` under its original name when available. If that
+name already exists, a numeric suffix is added: `speech.wav`, `speech_1.wav`,
+`speech_2.wav`, and so on. Existing archives are never overwritten, so producers
+can repeatedly publish the same input filename. Already-used suffixes are skipped;
+for example, if `sent/speech.wav` and `sent/speech_1.wav` exist, the next
+`speech.wav` is archived as `sent/speech_2.wav`.
+
+If an older gateway reports `archive destination exists/unavailable; leaving ...
+queued` when an archive of the same name exists, rebuild with
+`make ptt_wav_gate` and restart using the rebuilt binary. The queued input will
+then be processed without deleting earlier archives.
+
+Local transport errors are retried after about five seconds. Interrupted/failed
+sends retain their source WAV; retry can repeat a partially transmitted message.
+An archive failure after transmission stops the gateway with an error to avoid
+repeatedly sending the same file in that process.
+
+**Delivery semantics:** the existing UDP protocol has no acknowledgment or
+channel-grant response. `sent/` means successful local transmission, not confirmed
+receipt by the server or a listener. Packet loss, an unreachable server, or a
+busy server rejecting a competing talker cannot always be detected. The gateway
+uses the same best-effort semantics as `ptt_client`; it does not add a reliable
+file-transfer protocol. A crash between sending and archiving can also cause a
+repeat after restart.
+
+Each received PTT session produces its own
+`incoming/rx_YYYYMMDDTHHMMSS_nanoseconds_unique.wav`, including back-to-back or
+overlapping sessions. Output is uncompressed **48 kHz, mono, signed 16-bit
+little-endian PCM**. A hidden `.part` file is written first, then its WAV header
+is finalized, synced, and atomically renamed to `.wav`; downstream tools should
+watch only the final `rx_*.wav` files. END closes the recording after the jitter
+buffer drains; a lost END falls back to the receiver's two-second inactivity
+timeout. Packet-loss concealment and silence during gaps remain in the recording.
+Long sessions rotate every 30 minutes. Graceful shutdown finalizes current
+recordings; forced termination or disk errors may leave `.part` files for manual
+recovery. Receive write errors stop the gateway with a nonzero exit status.
+
+Network and audio recovery behavior is shared with `ptt_client`: UDP keepalives,
+protocol v2 validation, XChaCha20-Poly1305 encryption (`--encrypt --key PASSWORD`
+or `UDPPTT_KEY`), `--txid`, `--jitter-ms`, `--fec-loss-percent`, `--no-fec`,
+`--state-file`, and receive-only mode (`--rx-only`/`--no-ptt`). As with the client,
+local transmission suppresses reception. `--preamble-id ABCDE`, `--gps-file`, and
+`--telemetry-socket` work too; a preamble is transmitted before each WAV without
+a local audible monitor, and received preamble audio remains in the recording.
+Blackfiber transport and its MAC, EtherType, passive RX, and TX-only options are
+also supported (with the same raw-socket permissions as the client). Keyboard,
+HID/control-socket, ALSA, and local tone options do not apply to file mode.
+Use `./ptt_wav_gate --help` for the option summary.
+
+`make test` includes real relay/gateway round trips, encryption and wrong-key
+rejection, preambles, resampling, queue ownership, malformed/truncated files,
+repeated input filenames with preserved archives, separate back-to-back
+recordings, and interrupted sends.
+`make sanitize` runs the same integration checks with ASan/UBSan builds.
+
 ## UDP connection behavior
 
 The client keeps one UDP path continuously active by sending regular 

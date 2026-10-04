@@ -13,3 +13,6 @@ tests/test_telemetry
 tests/test_telemetry_sanitize
 tools/telemetry_lab
 Speech-Codebook.md
+
+ptt_wav_gate
+tests/ptt_wav_gate_sanitize

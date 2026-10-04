@@ -29,13 +29,16 @@ OPUS_LIBS := $(shell pkg-config --libs opus 2>/dev/null)
 CLIENT_CFLAGS := $(GST_CFLAGS) $(SODIUM_CFLAGS) $(OPUS_CFLAGS)
 CLIENT_LIBS   := $(GST_LIBS) $(SODIUM_LIBS) $(OPUS_LIBS)
 
-TARGETS = ptt_client ptt_server ptt_helper ptt_hid
+TARGETS = ptt_wav_gate ptt_client ptt_server ptt_helper ptt_hid
 DATAFILES = start.wav stop.wav
 
 all: $(TARGETS)
 
-ptt_client: ptt_client.c ptt_protocol.h ptt_jitter.h ptt_telemetry.h ptt_jitter.c ptt_telemetry.c
+ptt_client: ptt_client.c ptt_wav_io.h ptt_protocol.h ptt_jitter.h ptt_telemetry.h ptt_jitter.c ptt_telemetry.c
 	$(CC) $(CFLAGS) $(CLIENT_CFLAGS) -o $@ ptt_client.c ptt_jitter.c ptt_telemetry.c $(CLIENT_LIBS) -lm
+
+ptt_wav_gate: ptt_wav_gate.c ptt_client.c ptt_wav_io.h ptt_protocol.h ptt_jitter.h ptt_telemetry.h ptt_jitter.c ptt_telemetry.c
+	$(CC) $(CFLAGS) $(CLIENT_CFLAGS) -o $@ ptt_wav_gate.c ptt_jitter.c ptt_telemetry.c $(CLIENT_LIBS) -lm
 
 ptt_server: ptt_server.c ptt_protocol.h
 	$(CC) $(CFLAGS) -o $@ $<
@@ -49,6 +52,7 @@ ptt_hid: ptt_hid.c
 install: all
 	mkdir -p "$(DESTDIR)$(BINDIR)"
 	install -m 0755 ptt_client "$(DESTDIR)$(BINDIR)/ptt_client"
+	install -m 0755 ptt_wav_gate "$(DESTDIR)$(BINDIR)/ptt_wav_gate"
 	install -m 0755 ptt_server "$(DESTDIR)$(BINDIR)/ptt_server"
 	install -m 0755 ptt_helper "$(DESTDIR)$(BINDIR)/ptt_helper"
 	install -m 0755 ptt_hid "$(DESTDIR)$(BINDIR)/ptt_hid"
@@ -137,6 +141,7 @@ install-gnome-extension: all
 
 	mkdir -p "$(DESTDIR)$(BINDIR)"
 	install -m 0755 ptt_client "$(DESTDIR)$(BINDIR)/ptt_client"
+	install -m 0755 ptt_wav_gate "$(DESTDIR)$(BINDIR)/ptt_wav_gate"
 	install -m 0755 ptt_server "$(DESTDIR)$(BINDIR)/ptt_server"
 	install -m 0755 ptt_helper "$(DESTDIR)$(BINDIR)/ptt_helper"
 	install -m 0755 ptt_hid "$(DESTDIR)$(BINDIR)/ptt_hid"
@@ -214,6 +219,7 @@ install-gnome-extension: all
 
 uninstall:
 	rm -f "$(DESTDIR)$(BINDIR)/ptt_client"
+	rm -f "$(DESTDIR)$(BINDIR)/ptt_wav_gate"
 	rm -f "$(DESTDIR)$(BINDIR)/ptt_server"
 	rm -f "$(DESTDIR)$(BINDIR)/ptt_helper"
 	rm -f "$(DESTDIR)$(BINDIR)/ptt_hid"
@@ -231,7 +237,7 @@ uninstall-gnome-extension:
 	@echo "  gnome-extensions disable $(GNOME_EXTENSION_UUID)"
 
 clean:
-	rm -f $(TARGETS) tests/test_telemetry tests/test_telemetry_sanitize tools/telemetry_lab tests/test_recovery tests/test_client tests/test_recovery_sanitize tests/test_client_sanitize tests/ptt_server_sanitize
+	rm -f $(TARGETS) tests/test_telemetry tests/test_telemetry_sanitize tools/telemetry_lab tests/test_recovery tests/test_client tests/test_recovery_sanitize tests/test_client_sanitize tests/ptt_server_sanitize tests/ptt_wav_gate_sanitize
 
 .PHONY: all install install-gnome-extension uninstall uninstall-gnome-extension clean
 
@@ -239,7 +245,7 @@ TEST_CFLAGS = $(CFLAGS) -Werror -I.
 tests/test_recovery: tests/test_recovery.c ptt_jitter.c ptt_telemetry.c ptt_jitter.h ptt_telemetry.h ptt_protocol.h
 	$(CC) $(TEST_CFLAGS) $(OPUS_CFLAGS) -o $@ tests/test_recovery.c ptt_jitter.c ptt_telemetry.c $(OPUS_LIBS) -lm
 
-tests/test_client: tests/test_client.c ptt_client.c ptt_jitter.c ptt_telemetry.c ptt_jitter.h ptt_telemetry.h ptt_protocol.h
+tests/test_client: tests/test_client.c ptt_client.c ptt_wav_io.h ptt_jitter.c ptt_telemetry.c ptt_jitter.h ptt_telemetry.h ptt_protocol.h
 	$(CC) $(TEST_CFLAGS) $(CLIENT_CFLAGS) -o $@ tests/test_client.c ptt_jitter.c ptt_telemetry.c $(CLIENT_LIBS) -lm
 
 tests/test_telemetry: tests/test_telemetry.c ptt_telemetry.c ptt_telemetry.h
@@ -250,6 +256,7 @@ test: all tests/test_recovery tests/test_client tests/test_telemetry
 	./tests/test_recovery
 	./tests/test_client
 	python3 tests/test_server.py
+	python3 tests/test_wav_gate.py
 
 .PHONY: test
 
@@ -260,9 +267,11 @@ sanitize:
 	$(CC) $(SANITIZE_FLAGS) $(OPUS_CFLAGS) -o tests/test_recovery_sanitize tests/test_recovery.c ptt_jitter.c ptt_telemetry.c $(OPUS_LIBS) -lm
 	$(CC) $(SANITIZE_FLAGS) $(CLIENT_CFLAGS) -o tests/test_client_sanitize tests/test_client.c ptt_jitter.c ptt_telemetry.c $(CLIENT_LIBS) -lm
 	$(CC) $(SANITIZE_FLAGS) -o tests/ptt_server_sanitize ptt_server.c
+	$(CC) $(SANITIZE_FLAGS) $(CLIENT_CFLAGS) -o tests/ptt_wav_gate_sanitize ptt_wav_gate.c ptt_jitter.c ptt_telemetry.c $(CLIENT_LIBS) -lm
 	./tests/test_recovery_sanitize
 	ASAN_OPTIONS=detect_leaks=0 ./tests/test_client_sanitize
 	PTT_SERVER=./tests/ptt_server_sanitize python3 tests/test_server.py
+	ASAN_OPTIONS=detect_leaks=0 PTT_WAV_GATE=./tests/ptt_wav_gate_sanitize PTT_SERVER=./tests/ptt_server_sanitize python3 tests/test_wav_gate.py
 
 .PHONY: sanitize
 

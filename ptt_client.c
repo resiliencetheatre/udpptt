@@ -36,6 +36,10 @@
 #include "ptt_protocol.h"
 #include "ptt_jitter.h"
 
+#ifndef PTT_WAV_GATE
+#define PTT_WAV_GATE 0
+#endif
+
 #define DEFAULT_SERVER_PORT 5000
 #define DEFAULT_BLACKFIBER_ETHERTYPE 0x88B5
 #define LOCAL_PORT 0
@@ -600,7 +604,7 @@ static void set_ptt_state(app_t *app, int pressed) {
     if (old != pressed) {
         atomic_store(&app->microphone_ready, 0);
         if (pressed) atomic_fetch_add(&app->ptt_generation, 1);
-        printf("[%lld] PTT %s (txid=%s)\n", now_ms(), pressed ? (app->preamble_enabled ? "DOWN -> preamble; wait for cue to end" : "DOWN -> sending microphone audio") : "UP -> sending idle frames", app->txid); fflush(stdout);
+        printf("[%lld] PTT %s (txid=%s)\n", now_ms(), pressed ? (app->preamble_enabled ? "DOWN -> preamble; wait for cue to end" : (PTT_WAV_GATE ? "DOWN -> sending WAV audio" : "DOWN -> sending microphone audio")) : "UP -> sending idle frames", app->txid); fflush(stdout);
         state_file_set_tx(app, pressed);
         if (pressed) { if (!app->preamble_enabled && app->have_start_wav) play_tone_async(app, app->start_wav_path); }
         else { if (app->have_stop_wav) play_tone_async(app, app->stop_wav_path); }
@@ -1036,7 +1040,19 @@ static void cleanup(app_t *app) {
     pthread_mutex_destroy(&app->jitter_lock);
 }
 
+#include "ptt_wav_io.h"
+
 static void usage(const char *argv0) {
+    if (PTT_WAV_GATE) {
+        fprintf(stderr, "usage: %s <server-ip> --input-dir DIR --output-dir DIR [client network options]\n"
+                "  --port PORT --txid NAME --encrypt --key PASSWORD --rx-only\n"
+                "  --jitter-ms MS --fec-loss-percent N --no-fec --state-file PATH\n"
+                "  --preamble-id ABCDE --gps-file PATH --telemetry-socket PATH\n"
+                "  --blackfiber IFACE --bf-dst-mac MAC --bf-ethertype TYPE\n"
+                "  --blackfiber-rx-passive --blackfiber-tx-only\n"
+                "Completed sends move to DIR/sent/. RX: rx_[UTC timestamp].wav (48 kHz mono PCM16).\n", argv0);
+        return;
+    }
     fprintf(stderr,
             "usage: %s <server-ip> [--port PORT] [--txid NAME] [--rx-only|--no-ptt] [--encrypt] [--key PASSWORD]\n"
             "       [--codec-ptt] [--ptt-socket PATH] [--state-file PATH] [--rx-state-timeout-ms MS]\n"
@@ -1052,7 +1068,18 @@ int main(int argc, char **argv) {
     memset(&g_app, 0, sizeof(g_app)); pthread_mutex_init(&g_app.state_lock, NULL); pthread_mutex_init(&g_app.jitter_lock, NULL); g_app.jitter_ms = -1; g_app.loss_percent = 10; g_app.fec_enabled = 1; g_app.telemetry_fd = -1; g_app.sock = -1; g_app.ptt_ctrl_sock = -1; g_app.server_port = DEFAULT_SERVER_PORT; g_app.transport_mode = TRANSPORT_UDP; g_app.ptt_enabled = 1; g_app.pc_ptt_hold_ms = 2000; g_app.rx_state_timeout_ms = 1000; g_app.bf_ethertype = DEFAULT_BLACKFIBER_ETHERTYPE; memset(g_app.bf_dst_mac, 0xff, sizeof(g_app.bf_dst_mac)); snprintf(g_app.txid, sizeof(g_app.txid), "anon");
     const char *server_ip = NULL; const char *password = NULL;
     for (int i = 1; i < argc; ++i) {
-        if (!strcmp(argv[i], "--rx-only") || !strcmp(argv[i], "--no-ptt")) g_app.ptt_enabled = 0;
+        if (PTT_WAV_GATE && (!strcmp(argv[i], "--input-dir") || !strcmp(argv[i], "--output-dir"))) {
+            int input = !strcmp(argv[i], "--input-dir");
+            if (i + 1 >= argc || !argv[i+1][0] || strlen(argv[i+1]) >= PATH_MAX) return 1;
+            copy_opt_string(input ? wav_input : wav_output, PATH_MAX, argv[++i]);
+        }
+        else if (!strcmp(argv[i], "--help")) { usage(argv[0]); return 0; }
+        else if (PTT_WAV_GATE && (!strncmp(argv[i], "--alsa-", 7) || !strcmp(argv[i], "--rpi-audio") ||
+                 !strcmp(argv[i], "--codec-ptt") || !strcmp(argv[i], "--ptt-socket") ||
+                 !strcmp(argv[i], "--control-socket") || !strcmp(argv[i], "--altgr-ptt-delay-ms"))) {
+            fprintf(stderr, "hardware PTT/audio option is unavailable in WAV mode: %s\n", argv[i]); return 1;
+        }
+        else if (!strcmp(argv[i], "--rx-only") || !strcmp(argv[i], "--no-ptt")) g_app.ptt_enabled = 0;
         else if (!strcmp(argv[i], "--preamble-id")) {
             if (i + 1 >= argc || !tm_id(g_app.telemetry_tx.id, argv[++i])) {
                 fprintf(stderr, "--preamble-id requires exactly five letters A-Z\n"); return 1;
@@ -1116,6 +1143,8 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (PTT_WAV_GATE && wav_setup() != 0) return 1;
+
     if (g_app.gps_file[0] && !g_app.preamble_enabled) { fprintf(stderr, "--gps-file requires --preamble-id\n"); return 1; }
     if (g_app.telemetry_socket[0]) {
         g_app.telemetry_fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
@@ -1137,12 +1166,12 @@ int main(int argc, char **argv) {
     }
 
     if (g_app.ptt_socket_enabled) { g_app.ptt_ctrl_sock = make_ptt_control_socket(g_app.ptt_socket_path); if (g_app.ptt_ctrl_sock < 0) { cleanup(&g_app); return 1; } }
-    if (g_app.ptt_enabled) { g_app.capture_pipeline = g_app.preamble_enabled ? make_raw_capture_pipeline(&g_app.capture_sink, g_app.alsa_capture_device) : make_capture_pipeline(&g_app.capture_sink, g_app.alsa_capture_device, g_app.fec_enabled, g_app.loss_percent); if (!g_app.capture_pipeline) { cleanup(&g_app); return 1; } }
-    if (!g_app.blackfiber_tx_only) {
+    if (!PTT_WAV_GATE && g_app.ptt_enabled) { g_app.capture_pipeline = g_app.preamble_enabled ? make_raw_capture_pipeline(&g_app.capture_sink, g_app.alsa_capture_device) : make_capture_pipeline(&g_app.capture_sink, g_app.alsa_capture_device, g_app.fec_enabled, g_app.loss_percent); if (!g_app.capture_pipeline) { cleanup(&g_app); return 1; } }
+    if (!PTT_WAV_GATE && !g_app.blackfiber_tx_only) {
         g_app.playback_pipeline = make_playback_pipeline(&g_app.playback_src, g_app.alsa_playback_device);
         if (!g_app.playback_pipeline) { cleanup(&g_app); return 1; }
     }
-    init_ptt_tones(&g_app);
+    if (!PTT_WAV_GATE) init_ptt_tones(&g_app);
     atomic_store(&g_app.running, 1); atomic_store(&g_app.ptt_pressed, 0); atomic_store(&g_app.ptt_keyboard_pressed, 0); atomic_store(&g_app.ptt_socket_pressed, 0); atomic_store(&g_app.suppress_playback, 0);
     if (g_app.state_file_enabled) state_file_write_idle(&g_app);
 
@@ -1162,16 +1191,20 @@ int main(int argc, char **argv) {
     }
 
     printf("protocol=v2 jitter_ms=%d fec=%s expected_loss=%d%%\n", g_app.jitter_ms, g_app.fec_enabled ? "on" : "off", g_app.loss_percent);
-    printf("txid: %s\n", g_app.txid); printf("debug: shows PTT state, transmitted mic packets, received audio packets, and playback events\n");
+    printf("txid: %s\n", g_app.txid); printf("debug: shows PTT state, transmitted and received audio packets\n");
     if (!g_app.ptt_enabled) printf("mode: receive-only (--rx-only), keyboard PTT disabled, microphone capture disabled\n");
     if (g_app.encrypt_enabled) printf("encryption: enabled (XChaCha20-Poly1305 payload encryption, cleartext authenticated talk_id)\n"); else printf("encryption: disabled\n");
+    if (PTT_WAV_GATE) printf("WAV input: %s; output: %s\n", wav_input, wav_output);
+    else {
     printf("ptt input: %s\n", g_app.codec_ptt_enabled ? "codec-ptt (KEY_ENTER)" : "keyboard Right Alt / AltGr"); if (!g_app.codec_ptt_enabled) printf("altgr ptt delay: %d ms\n", g_app.pc_ptt_hold_ms); if (g_app.ptt_socket_enabled) printf("ptt socket: %s\n", g_app.ptt_socket_path); if (g_app.state_file_enabled) printf("ptt state file: %s (rx timeout=%d ms)\n", g_app.state_file_path, g_app.rx_state_timeout_ms);
     if (g_app.alsa_capture_device[0]) printf("capture: alsasrc device=\"%s\"\n", g_app.alsa_capture_device); else printf("capture: autoaudiosrc\n");
     if (g_app.alsa_playback_device[0]) printf("playback: alsasink device=\"%s\"\n", g_app.alsa_playback_device); else printf("playback: autoaudiosink\n"); fflush(stdout);
     if (g_app.ptt_enabled) { if (pthread_create(&g_app.key_thread, NULL, keyboard_thread_main, &g_app) != 0) { perror("pthread_create(key_thread)"); cleanup(&g_app); return 1; } }
+    }
+    fflush(stdout);
     if (g_app.ptt_socket_enabled) { if (pthread_create(&g_app.ctrl_thread, NULL, ptt_control_thread_main, &g_app) != 0) { perror("pthread_create(ctrl_thread)"); cleanup(&g_app); return 1; } }
     if (!(g_app.transport_mode == TRANSPORT_BLACKFIBER && g_app.blackfiber_rx_passive)) {
-        if (pthread_create(&g_app.send_thread, NULL, send_thread_main, &g_app) != 0) {
+        if (pthread_create(&g_app.send_thread, NULL, PTT_WAV_GATE ? wav_send_thread : send_thread_main, &g_app) != 0) {
             perror("pthread_create(send_thread)");
             cleanup(&g_app);
             return 1;
@@ -1185,7 +1218,7 @@ int main(int argc, char **argv) {
         }
     }
     if (!(g_app.transport_mode == TRANSPORT_BLACKFIBER && g_app.blackfiber_tx_only)) {
-        if (pthread_create(&g_app.play_thread, NULL, play_thread_main, &g_app) != 0) {
+        if (pthread_create(&g_app.play_thread, NULL, PTT_WAV_GATE ? wav_receive_thread : play_thread_main, &g_app) != 0) {
             perror("pthread_create(playback)"); cleanup(&g_app); return 1;
         }
     }
@@ -1196,5 +1229,5 @@ int main(int argc, char **argv) {
         if (mono_ms() >= next_report) { report_rx_stats(&g_app); next_report = mono_ms() + 5000; }
         msleep_int(100);
     }
-    cleanup(&g_app); return 0;
+    cleanup(&g_app); return PTT_WAV_GATE ? wav_failed : 0;
 }
