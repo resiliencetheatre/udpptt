@@ -35,7 +35,7 @@ validation, especially with speakers, Bluetooth and exclusive ALSA devices.
 
 ```sh
 ./ptt_client 198.51.100.10 --txid Alpha --preamble-id ALPHA \
-    --gps-file /run/user/1000/udpptt-gps.txt
+    --gps-file "$XDG_RUNTIME_DIR/udpptt-gps.txt"
 ```
 
 An external GPS producer writes one short text record:

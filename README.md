@@ -9,6 +9,11 @@ Simple UDP push-to-talk audio test program using a client/server model.
 
 ## WAV file gateway
 
+For an ncurses chat interface with Whisper receive transcription and Kokoro
+speech generation, see [operator](operator/README.md). Build with
+`make -C operator`, then run `./operator/operator` alongside an existing gateway,
+or `./operator/operator --start-gate` to launch the configured gateway as well.
+
 `ptt_wav_gate` uses WAV files in place of the client's PTT button, microphone,
 and speaker. It does not launch Kokoro, whisper.cpp, or any other external
 binary. Build it with `make ptt_wav_gate` (also included in `make` and the install
