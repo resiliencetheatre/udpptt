@@ -672,8 +672,14 @@ The default capture device in this mode is `plughw:CARD=UACDemoV10,DEV=0`;
 ALSA converts the microphone's native 16 kHz audio to the client's 48 kHz format.
 Use `--alsa-capture-device` or `--alsa-device` to override it, especially with
 multiple USB units. Playback selection is unchanged. The existing input-device
-reader needs access to `/dev/input/event*` and watches F2 on all readable devices;
-it does not exclusively grab the microphone or discover newly plugged devices.
+reader needs access to `/dev/input/event*`. In USB PTT mode it selects only USB
+`7273:8378` input interfaces advertising F2 and exclusively grabs them, preventing
+the microphone's key events from reaching the focused terminal or application.
+The grab covers all keys on those interfaces; regular keyboards are left alone
+and their F2 keys do not trigger USB PTT. Closing the client releases the grabs.
+If a grab fails (for example, another client owns it), the interface is skipped
+with an error. Other microphone USB IDs are not currently selected.
+The reader does not discover newly plugged devices.
 Restart after reconnecting. Existing socket PTT control also triggers capture,
 so the hardware button must be held when using it with this microphone.
 `--usbptt` cannot be combined with `--codec-ptt` and is unavailable in WAV mode.

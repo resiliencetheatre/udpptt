@@ -658,9 +658,33 @@ static void *ptt_control_thread_main(void *arg) {
 
 static void *keyboard_thread_main(void *arg) {
     app_t *app = (app_t *)arg; int fds[INPUT_SCAN_MAX]; int nfds = 0; int altgr_pending = 0; int usb_pressed_fd = -1; long long altgr_press_start_ms = 0;
-    for (int i = 0; i < INPUT_SCAN_MAX; ++i) { char path[64]; snprintf(path, sizeof(path), "/dev/input/event%d", i); int fd = open(path, O_RDONLY | O_NONBLOCK); if (fd >= 0) fds[nfds++] = fd; }
-    if (nfds == 0) { fprintf(stderr, "keyboard debug: no /dev/input/event* readable\n"); return NULL; }
-    if (app->usbptt) printf("keyboard debug: monitoring USB PTT (KEY_F2) on %d input device(s)\n", nfds);
+    for (int i = 0; i < INPUT_SCAN_MAX; ++i) {
+        char path[64]; snprintf(path, sizeof(path), "/dev/input/event%d", i);
+        int fd = open(path, O_RDONLY | O_NONBLOCK);
+        if (fd < 0) continue;
+        if (app->usbptt) {
+            struct input_id id;
+            unsigned char keys[KEY_MAX / 8 + 1] = {0};
+            /* EVIOCGRAB covers the entire interface: never grab a normal keyboard. */
+            if (ioctl(fd, EVIOCGID, &id) < 0 || id.bustype != BUS_USB ||
+                id.vendor != 0x7273 || id.product != 0x8378 ||
+                ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keys)), keys) < 0 ||
+                !(keys[KEY_F2 / 8] & (1u << (KEY_F2 % 8)))) {
+                close(fd); continue;
+            }
+            if (ioctl(fd, EVIOCGRAB, 1) < 0) {
+                fprintf(stderr, "USB PTT: cannot exclusively grab %s: %s\n", path, strerror(errno));
+                close(fd); continue;
+            }
+            printf("USB PTT: exclusively grabbed %s (7273:8378)\n", path);
+        }
+        fds[nfds++] = fd;
+    }
+    if (nfds == 0) {
+        fprintf(stderr, "%s\n", app->usbptt ? "USB PTT: no readable, exclusively grabbable 7273:8378 F2 input device found" : "keyboard debug: no /dev/input/event* readable");
+        return NULL;
+    }
+    if (app->usbptt) printf("keyboard debug: monitoring USB PTT (KEY_F2) exclusively on %d input device(s)\n", nfds);
     else if (app->codec_ptt_enabled) printf("keyboard debug: monitoring codec PTT key (KEY_ENTER) on %d input device(s)\n", nfds);
     else printf("keyboard debug: monitoring Right Alt / AltGr on %d input device(s), hold threshold=%d ms\n", nfds, app->pc_ptt_hold_ms);
     fflush(stdout);
@@ -694,7 +718,8 @@ static void *keyboard_thread_main(void *arg) {
         if (!had_event) msleep_int(10);
     }
     for (int i = 0; i < nfds; ++i) {
-        close(fds[i]);
+        /* Closing the descriptor also releases its exclusive input grab. */
+        if (fds[i] >= 0) close(fds[i]);
     }
     return NULL;
 }
