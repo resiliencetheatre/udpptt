@@ -18,8 +18,61 @@ static packet_hdr_t wait_type(int sock, unsigned type) {
     return (packet_hdr_t){0};
 }
 
+static void test_mic_gain(void) {
+    const int input[] = {0, 1, -1, 1000, -1000, 20000, -20000, 32767, -32768};
+    const int expected[][9] = {
+        {0, 1, -1, 1000, -1000, 20000, -20000, 32767, -32768},
+        {0, 2, -2, 2000, -2000, 32767, -32768, 32767, -32768},
+        {0, 1, -1, 500, -500, 10000, -10000, 16384, -16384}
+    };
+    const double db[] = {0, 20 * log10(2.0), -20 * log10(2.0)};
+    for (int le = 0; le <= 1; le++) for (int gain = 0; gain < 3; gain++) {
+        app_t app = {0};
+        app.mic_gain_db = db[gain]; app.mic_gain_multiplier = pow(10.0, db[gain] / 20.0);
+        unsigned char pcm[sizeof(input) / sizeof(input[0]) * 2];
+        for (size_t i = 0; i < 9; i++) {
+            if (le) GST_WRITE_UINT16_LE(pcm + 2*i, (uint16_t)input[i]);
+            else GST_WRITE_UINT16_BE(pcm + 2*i, (uint16_t)input[i]);
+        }
+        apply_mic_gain(&app, pcm, sizeof(pcm), le);
+        for (size_t i = 0; i < 9; i++) {
+            unsigned bits = le ? GST_READ_UINT16_LE(pcm + 2*i) : GST_READ_UINT16_BE(pcm + 2*i);
+            int value = bits >= 32768 ? (int)bits - 65536 : (int)bits;
+            assert(value == expected[gain][i]);
+        }
+        assert(app.mic_clipped_samples == (gain == 1 ? 4 : 0));
+        if (gain == 1) {
+            int64_t warned = app.mic_clip_warning_ms;
+            apply_mic_gain(&app, pcm, sizeof(pcm), le);
+            assert(app.mic_clipped_samples == 8);
+            assert(app.mic_clip_warning_ms == warned);
+        }
+    }
+    /* Exercise the real writable-buffer probe with shared input storage. */
+    app_t app = {0}; app.mic_gain_db = 20; app.mic_gain_multiplier = 10;
+    GstElement *pipeline = gst_parse_launch("appsrc name=input ! identity name=mic_gain ! appsink name=output sync=false", NULL);
+    app.capture_pipeline = pipeline; install_mic_gain(&app);
+    GstElement *src = gst_bin_get_by_name(GST_BIN(pipeline), "input");
+    GstElement *sink = gst_bin_get_by_name(GST_BIN(pipeline), "output");
+    GstBuffer *buffer = gst_buffer_new_allocate(NULL, 2, NULL);
+    unsigned char pcm[2]; GST_WRITE_UINT16_LE(pcm, 4000); gst_buffer_fill(buffer, 0, pcm, 2);
+    GstBuffer *original = gst_buffer_ref(buffer);
+    gst_element_set_state(pipeline, GST_STATE_PLAYING);
+    assert(gst_app_src_push_buffer(GST_APP_SRC(src), buffer) == GST_FLOW_OK);
+    GstSample *sample = gst_app_sink_try_pull_sample(GST_APP_SINK(sink), GST_SECOND);
+    assert(sample);
+    gst_buffer_extract(gst_sample_get_buffer(sample), 0, pcm, 2);
+    assert(GST_READ_UINT16_LE(pcm) == 32767);
+    gst_buffer_extract(original, 0, pcm, 2); assert(GST_READ_UINT16_LE(pcm) == 4000);
+    gst_sample_unref(sample); gst_buffer_unref(original);
+    gst_element_set_state(pipeline, GST_STATE_NULL);
+    assert(app.mic_clipped_samples == 1);
+    gst_object_unref(src); gst_object_unref(sink); gst_object_unref(pipeline);
+}
+
 int main(int argc, char **argv) {
     gst_init(&argc, &argv); assert(sodium_init() >= 0);
+    test_mic_gain();
     app_t *tx = calloc(1, sizeof(*tx)), *rx = calloc(1, sizeof(*rx));
     assert(tx && rx);
     pthread_mutex_init(&tx->jitter_lock, NULL);
@@ -132,6 +185,9 @@ int main(int argc, char **argv) {
         tx->usbptt = 1; tx->capture_generation = 0; tx->capture_active = 0;
         tx->capture_pipeline = raw ? make_raw_capture_pipeline(&tx->capture_sink, "null", 1)
             : make_capture_pipeline(&tx->capture_sink, "null", 1, 10, 1);
+        tx->preamble_enabled = raw;
+        tx->mic_gain_db = 6; tx->mic_gain_multiplier = pow(10.0, 6.0 / 20.0);
+        install_mic_gain(tx);
         GstState state;
         update_usb_capture(tx);
         gst_element_get_state(tx->capture_pipeline, &state, NULL, GST_SECOND);
@@ -156,7 +212,7 @@ int main(int argc, char **argv) {
         gst_object_unref(tx->capture_sink); gst_object_unref(tx->capture_pipeline);
         tx->capture_sink = tx->capture_pipeline = NULL;
     }
-    tx->usbptt = 0;
+    tx->usbptt = 0; tx->preamble_enabled = 0; tx->mic_gain_db = 0;
 
     /* GPS is an atomic snapshot file; missing/stale/malformed fixes fall back
      * to ID only rather than emitting a fabricated coordinate. */

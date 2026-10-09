@@ -670,6 +670,19 @@ until the cue finishes.
 
 The default capture device in this mode is `plughw:CARD=UACDemoV10,DEV=0`;
 ALSA converts the microphone's native 16 kHz audio to the client's 48 kHz format.
+Use `--mic-gain-db DB` to adjust software microphone gain, for example
+`./ptt_client 198.51.100.10 --usbptt --mic-gain-db 6 --txid Bravo`.
+The default is 0 dB (unchanged PCM); accepted values range from -60 to +60 dB.
+Positive values amplify and negative values attenuate, using
+`pow(10.0, DB / 20.0)` (about twice the amplitude at +6 dB).
+Gain applies to captured PCM before encoding, including preamble-mode speech,
+but not to generated preamble tones or received audio. It also works with other
+live microphone capture modes; it is unavailable in WAV mode.
+Samples are rounded and safely clamped to the signed 16-bit range, without
+integer wraparound. When clipping occurs, a cumulative clipped-sample count is
+reported immediately and at most once every five seconds thereafter while
+clipping continues. Reduce the gain if these warnings appear. Counts cover the
+client's lifetime, including idle capture in continuous-capture modes.
 Use `--alsa-capture-device` or `--alsa-device` to override it, especially with
 multiple USB units. Playback selection is unchanged. The existing input-device
 reader needs access to `/dev/input/event*`. In USB PTT mode it selects only USB

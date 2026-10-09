@@ -107,6 +107,10 @@ typedef struct {
     int encrypt_enabled;
     int codec_ptt_enabled;
     int usbptt;
+    double mic_gain_db;
+    double mic_gain_multiplier;
+    uint64_t mic_clipped_samples;
+    int64_t mic_clip_warning_ms;
     unsigned capture_generation;
     int capture_active;
     int pc_ptt_hold_ms;
@@ -400,10 +404,59 @@ static int make_blackfiber_socket(app_t *app) {
     return fd;
 }
 
+/* Called by the capture streaming thread only. Clamp before narrowing to PCM16. */
+static void apply_mic_gain(app_t *app, unsigned char *pcm, size_t bytes, int little_endian) {
+    if (app->mic_gain_db == 0) return;
+    uint64_t clipped = 0;
+    for (size_t i = 0; i + 1 < bytes; i += 2) {
+        uint16_t bits = little_endian ? GST_READ_UINT16_LE(pcm + i) : GST_READ_UINT16_BE(pcm + i);
+        int sample = bits >= 32768 ? (int)bits - 65536 : (int)bits;
+        double scaled = sample * app->mic_gain_multiplier;
+        int result;
+        if (scaled > INT16_MAX) { result = INT16_MAX; clipped++; }
+        else if (scaled < INT16_MIN) { result = INT16_MIN; clipped++; }
+        else result = (int)lround(scaled);
+        if (little_endian) GST_WRITE_UINT16_LE(pcm + i, (uint16_t)result);
+        else GST_WRITE_UINT16_BE(pcm + i, (uint16_t)result);
+    }
+    app->mic_clipped_samples += clipped;
+    int64_t now = mono_ms();
+    if (clipped && (!app->mic_clip_warning_ms || now - app->mic_clip_warning_ms >= 5000)) {
+        fprintf(stderr, "microphone gain %.2f dB: %llu clipped samples total; reduce --mic-gain-db\n",
+                app->mic_gain_db, (unsigned long long)app->mic_clipped_samples);
+        app->mic_clip_warning_ms = now;
+    }
+}
+
+static GstPadProbeReturn mic_gain_probe(GstPad *pad, GstPadProbeInfo *info, gpointer data) {
+    (void)pad;
+    app_t *app = data;
+    GstBuffer *buffer = gst_buffer_make_writable(GST_PAD_PROBE_INFO_BUFFER(info));
+    GST_PAD_PROBE_INFO_DATA(info) = buffer;
+    if (!buffer) return GST_PAD_PROBE_DROP;
+    GstMapInfo map;
+    if (!gst_buffer_map(buffer, &map, GST_MAP_READWRITE)) {
+        fprintf(stderr, "microphone gain: cannot map capture PCM\n");
+        return GST_PAD_PROBE_DROP;
+    }
+    /* Encoded capture negotiates S16LE; raw preamble capture uses native S16. */
+    apply_mic_gain(app, map.data, map.size, !app->preamble_enabled || G_BYTE_ORDER == G_LITTLE_ENDIAN);
+    gst_buffer_unmap(buffer, &map);
+    return GST_PAD_PROBE_OK;
+}
+
+static void install_mic_gain(app_t *app) {
+    if (app->mic_gain_db == 0) return;
+    GstElement *element = gst_bin_get_by_name(GST_BIN(app->capture_pipeline), "mic_gain");
+    GstPad *pad = gst_element_get_static_pad(element, "src");
+    gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, mic_gain_probe, app, NULL);
+    gst_object_unref(pad); gst_object_unref(element);
+}
+
 static GstElement *make_capture_pipeline(GstElement **out_sink, const char *alsa_device, int fec, int loss, int deferred) {
     GError *err = NULL; char desc[768];
-    if (alsa_device && alsa_device[0]) snprintf(desc, sizeof(desc), "alsasrc device=\"%s\" ! audio/x-raw,format=S16LE,channels=1,rate=48000 ! audioconvert ! audioresample ! opusenc frame-size=20 bitrate=24000 audio-type=voice inband-fec=%s packet-loss-percentage=%d ! appsink name=capture_sink emit-signals=false sync=false max-buffers=8 drop=true", alsa_device, fec ? "true" : "false", loss);
-    else snprintf(desc, sizeof(desc), "autoaudiosrc ! audio/x-raw,format=S16LE,channels=1,rate=48000 ! audioconvert ! audioresample ! opusenc frame-size=20 bitrate=24000 audio-type=voice inband-fec=%s packet-loss-percentage=%d ! appsink name=capture_sink emit-signals=false sync=false max-buffers=8 drop=true", fec ? "true" : "false", loss);
+    if (alsa_device && alsa_device[0]) snprintf(desc, sizeof(desc), "alsasrc device=\"%s\" ! audio/x-raw,format=S16LE,channels=1,rate=48000 ! identity name=mic_gain ! audioconvert ! audioresample ! opusenc frame-size=20 bitrate=24000 audio-type=voice inband-fec=%s packet-loss-percentage=%d ! appsink name=capture_sink emit-signals=false sync=false max-buffers=8 drop=true", alsa_device, fec ? "true" : "false", loss);
+    else snprintf(desc, sizeof(desc), "autoaudiosrc ! audio/x-raw,format=S16LE,channels=1,rate=48000 ! identity name=mic_gain ! audioconvert ! audioresample ! opusenc frame-size=20 bitrate=24000 audio-type=voice inband-fec=%s packet-loss-percentage=%d ! appsink name=capture_sink emit-signals=false sync=false max-buffers=8 drop=true", fec ? "true" : "false", loss);
     GstElement *pipeline = gst_parse_launch(desc, &err);
     if (!pipeline || err) { fprintf(stderr, "capture pipeline error: %s\n", err ? err->message : "unknown"); if (err) g_error_free(err); if (pipeline) gst_object_unref(pipeline); return NULL; }
     *out_sink = gst_bin_get_by_name(GST_BIN(pipeline), "capture_sink"); if (!*out_sink) { fprintf(stderr, "failed to get capture_sink\n"); gst_object_unref(pipeline); return NULL; }
@@ -820,8 +873,8 @@ static void *send_thread_main(void *arg) {
 /* Capture PCM only in preamble mode: one libopus encoder handles both sources. */
 static GstElement *make_raw_capture_pipeline(GstElement **sink, const char *device, int deferred) {
     char desc[768]; GError *error = NULL;
-    if (device[0]) snprintf(desc, sizeof(desc), "alsasrc device=\"%s\" ! audioconvert ! audioresample ! audio/x-raw,format=%s,channels=1,rate=48000,layout=interleaved ! appsink name=raw sync=false max-buffers=8 drop=true", device, GST_AUDIO_NE(S16));
-    else snprintf(desc, sizeof(desc), "autoaudiosrc ! audioconvert ! audioresample ! audio/x-raw,format=%s,channels=1,rate=48000,layout=interleaved ! appsink name=raw sync=false max-buffers=8 drop=true", GST_AUDIO_NE(S16));
+    if (device[0]) snprintf(desc, sizeof(desc), "alsasrc device=\"%s\" ! audioconvert ! audioresample ! audio/x-raw,format=%s,channels=1,rate=48000,layout=interleaved ! identity name=mic_gain ! appsink name=raw sync=false max-buffers=8 drop=true", device, GST_AUDIO_NE(S16));
+    else snprintf(desc, sizeof(desc), "autoaudiosrc ! audioconvert ! audioresample ! audio/x-raw,format=%s,channels=1,rate=48000,layout=interleaved ! identity name=mic_gain ! appsink name=raw sync=false max-buffers=8 drop=true", GST_AUDIO_NE(S16));
     GstElement *pipeline = gst_parse_launch(desc, &error);
     if (!pipeline || error) {
         fprintf(stderr, "raw capture: %s\n", error ? error->message : "creation failed");
@@ -1129,7 +1182,7 @@ static void usage(const char *argv0) {
             "usage: %s <server-ip> [--port PORT] [--txid NAME] [--rx-only|--no-ptt] [--encrypt] [--key PASSWORD]\n"
             "       [--codec-ptt] [--ptt-socket PATH] [--state-file PATH] [--rx-state-timeout-ms MS]\n"
             "       [--altgr-ptt-delay-ms MS] [--rpi-audio]\n"
-            "       [--usbptt] [--alsa-device DEV] [--alsa-capture-device DEV] [--alsa-playback-device DEV]\n"
+            "       [--usbptt] [--mic-gain-db DB] [--alsa-device DEV] [--alsa-capture-device DEV] [--alsa-playback-device DEV]\n"
             "       [--preamble-id ABCDE] [--gps-file PATH] [--telemetry-socket PATH]\n"
             "       [--jitter-ms 0..1000] [--fec-loss-percent 0..100] [--no-fec]\n"
             "       [--blackfiber IFACE] [--bf-dst-mac MAC] [--bf-ethertype ETHERTYPE]\n"
@@ -1146,7 +1199,7 @@ int main(int argc, char **argv) {
             copy_opt_string(input ? wav_input : wav_output, PATH_MAX, argv[++i]);
         }
         else if (!strcmp(argv[i], "--help")) { usage(argv[0]); return 0; }
-        else if (PTT_WAV_GATE && (!strncmp(argv[i], "--alsa-", 7) || !strcmp(argv[i], "--rpi-audio") ||
+        else if (PTT_WAV_GATE && (!strncmp(argv[i], "--alsa-", 7) || !strcmp(argv[i], "--rpi-audio") || !strcmp(argv[i], "--mic-gain-db") ||
                  !strcmp(argv[i], "--codec-ptt") || !strcmp(argv[i], "--usbptt") || !strcmp(argv[i], "--ptt-socket") ||
                  !strcmp(argv[i], "--control-socket") || !strcmp(argv[i], "--altgr-ptt-delay-ms"))) {
             fprintf(stderr, "hardware PTT/audio option is unavailable in WAV mode: %s\n", argv[i]); return 1;
@@ -1177,6 +1230,15 @@ int main(int argc, char **argv) {
             if (jitter) g_app.jitter_ms = (int)v; else g_app.loss_percent = (int)v;
         }
         else if (!strcmp(argv[i], "--encrypt")) g_app.encrypt_enabled = 1;
+        else if (!strcmp(argv[i], "--mic-gain-db")) {
+            if (i + 1 >= argc) { fprintf(stderr, "missing value for --mic-gain-db\n"); return 1; }
+            char *end; errno = 0; double db = strtod(argv[++i], &end);
+            if (errno || !argv[i][0] || *end || !isfinite(db) || db < -60 || db > 60) {
+                fprintf(stderr, "--mic-gain-db requires a finite number from -60 to 60\n"); return 1;
+            }
+            g_app.mic_gain_db = db;
+            g_app.mic_gain_multiplier = pow(10.0, db / 20.0);
+        }
         else if (!strcmp(argv[i], "--usbptt")) g_app.usbptt = 1;
         else if (!strcmp(argv[i], "--codec-ptt")) g_app.codec_ptt_enabled = 1;
         else if (!strcmp(argv[i], "--ptt-socket") || !strcmp(argv[i], "--control-socket")) { if (i + 1 >= argc) { fprintf(stderr, "missing value for %s\n", argv[i]); return 1; } copy_opt_string(g_app.ptt_socket_path, sizeof(g_app.ptt_socket_path), argv[++i]); g_app.ptt_socket_enabled = 1; }
@@ -1245,7 +1307,14 @@ int main(int argc, char **argv) {
     }
 
     if (g_app.ptt_socket_enabled) { g_app.ptt_ctrl_sock = make_ptt_control_socket(g_app.ptt_socket_path); if (g_app.ptt_ctrl_sock < 0) { cleanup(&g_app); return 1; } }
-    if (!PTT_WAV_GATE && g_app.ptt_enabled) { g_app.capture_pipeline = g_app.preamble_enabled ? make_raw_capture_pipeline(&g_app.capture_sink, g_app.alsa_capture_device, g_app.usbptt) : make_capture_pipeline(&g_app.capture_sink, g_app.alsa_capture_device, g_app.fec_enabled, g_app.loss_percent, g_app.usbptt); if (!g_app.capture_pipeline) { cleanup(&g_app); return 1; } }
+    if (!PTT_WAV_GATE && g_app.ptt_enabled) {
+        g_app.capture_pipeline = g_app.preamble_enabled
+            ? make_raw_capture_pipeline(&g_app.capture_sink, g_app.alsa_capture_device, 1)
+            : make_capture_pipeline(&g_app.capture_sink, g_app.alsa_capture_device, g_app.fec_enabled, g_app.loss_percent, 1);
+        if (!g_app.capture_pipeline) { cleanup(&g_app); return 1; }
+        install_mic_gain(&g_app);
+        if (!g_app.usbptt) gst_element_set_state(g_app.capture_pipeline, GST_STATE_PLAYING);
+    }
     if (!PTT_WAV_GATE && !g_app.blackfiber_tx_only) {
         g_app.playback_pipeline = make_playback_pipeline(&g_app.playback_src, g_app.alsa_playback_device);
         if (!g_app.playback_pipeline) { cleanup(&g_app); return 1; }
