@@ -648,6 +648,43 @@ Black fiber example:
 
 ### Codec / embedded PTT mode
 
+### USB PTT microphones (F2)
+
+Use `--usbptt` for microphones such as the tested QX-18 / UACDemoV1.0
+(USB `7273:8378`) that enable their capture hardware only while PTT is held:
+
+```sh
+./ptt_client 198.51.100.10 --usbptt --txid Bravo
+# Optional: also use the microphone's speaker for received audio.
+./ptt_client 198.51.100.10 --usbptt --txid Bravo \
+  --alsa-playback-device plughw:CARD=UACDemoV10,DEV=0
+```
+
+This selects immediate F2 press/release PTT, ignoring autorepeat. Capture stays
+closed at startup, opens on a press, and closes on release. Release is processed
+by the sender after its current bounded audio wait (up to 50 ms). Capture errors
+(including the hardware's release-time EIO) close capture without exiting or
+repeatedly reopening it while held; release and press again to retry. Very short
+taps may produce no audio. Preamble mode is supported and still gates speech
+until the cue finishes.
+
+The default capture device in this mode is `plughw:CARD=UACDemoV10,DEV=0`;
+ALSA converts the microphone's native 16 kHz audio to the client's 48 kHz format.
+Use `--alsa-capture-device` or `--alsa-device` to override it, especially with
+multiple USB units. Playback selection is unchanged. The existing input-device
+reader needs access to `/dev/input/event*` and watches F2 on all readable devices;
+it does not exclusively grab the microphone or discover newly plugged devices.
+Restart after reconnecting. Existing socket PTT control also triggers capture,
+so the hardware button must be held when using it with this microphone.
+`--usbptt` cannot be combined with `--codec-ptt` and is unavailable in WAV mode.
+Receive-only mode still disables capture. Without `--usbptt`, recording continues
+to start at program startup as before.
+
+Desk verification: try long holds, short taps, repeated presses, release-time
+errors, unplugging while held, and Ctrl+C. Confirm audio reaches a second client
+and that the next press works after each release. Automated tests use ALSA's
+null device; they do not establish USB hardware compatibility.
+
 - The `--codec-ptt` option switches PTT input handling to **KEY_ENTER**.
 - This is intended for embedded or codec-board GPIO/button input devices such as `ptt_keys`.
 - In `--codec-ptt` mode, PTT activation is immediate and does not use the AltGr delay logic.

@@ -88,7 +88,7 @@ int main(int argc, char **argv) {
 
     /* Verify the real capture pipeline enables FEC and emits 20 ms Opus. */
     GstElement *capture_sink = NULL;
-    GstElement *capture = make_capture_pipeline(&capture_sink, "null", 1, 10);
+    GstElement *capture = make_capture_pipeline(&capture_sink, "null", 1, 10, 0);
     assert(capture && capture_sink);
     GstElement *encoder = gst_bin_get_by_name(GST_BIN(capture), "opusenc0");
     assert(encoder);
@@ -126,6 +126,38 @@ int main(int argc, char **argv) {
     gst_element_set_state(capture, GST_STATE_NULL);
     gst_object_unref(capture_sink); gst_object_unref(capture);
 
+    /* Deferred USB capture stays NULL while idle, closes on release/error,
+     * and only retries after a fresh press (also covers raw preamble capture). */
+    for (int raw = 0; raw < 2; raw++) {
+        tx->usbptt = 1; tx->capture_generation = 0; tx->capture_active = 0;
+        tx->capture_pipeline = raw ? make_raw_capture_pipeline(&tx->capture_sink, "null", 1)
+            : make_capture_pipeline(&tx->capture_sink, "null", 1, 10, 1);
+        GstState state;
+        update_usb_capture(tx);
+        gst_element_get_state(tx->capture_pipeline, &state, NULL, GST_SECOND);
+        assert(state == GST_STATE_NULL && !tx->capture_active);
+        set_ptt_state(tx, 1); update_usb_capture(tx);
+        assert(tx->capture_active);
+        sample = gst_app_sink_try_pull_sample(GST_APP_SINK(tx->capture_sink), 2 * GST_SECOND);
+        assert(sample); gst_sample_unref(sample);
+        GError *error = g_error_new_literal(GST_RESOURCE_ERROR, GST_RESOURCE_ERROR_READ, "simulated USB release EIO");
+        assert(gst_element_post_message(tx->capture_pipeline,
+            gst_message_new_error(GST_OBJECT(tx->capture_pipeline), error, "test")));
+        g_error_free(error);
+        update_usb_capture(tx); assert(!tx->capture_active);
+        update_usb_capture(tx); assert(!tx->capture_active);
+        set_ptt_state(tx, 0); update_usb_capture(tx);
+        set_ptt_state(tx, 1); update_usb_capture(tx); assert(tx->capture_active);
+        sample = gst_app_sink_try_pull_sample(GST_APP_SINK(tx->capture_sink), 2 * GST_SECOND);
+        assert(sample); gst_sample_unref(sample);
+        set_ptt_state(tx, 0); update_usb_capture(tx);
+        gst_element_get_state(tx->capture_pipeline, &state, NULL, GST_SECOND);
+        assert(state == GST_STATE_NULL && !tx->capture_active);
+        gst_object_unref(tx->capture_sink); gst_object_unref(tx->capture_pipeline);
+        tx->capture_sink = tx->capture_pipeline = NULL;
+    }
+    tx->usbptt = 0;
+
     /* GPS is an atomic snapshot file; missing/stale/malformed fixes fall back
      * to ID only rather than emitting a fabricated coordinate. */
     char fix_path[] = "/tmp/udpptt-fix-XXXXXX"; int fix_fd = mkstemp(fix_path); assert(fix_fd >= 0);
@@ -159,7 +191,7 @@ int main(int argc, char **argv) {
      * early release, a new burst on re-press, CRC-decoded audio and ready gate. */
     tx->preamble_enabled = 1; assert(tm_id(tx->telemetry_tx.id, "ALPHA"));
     snprintf(tx->alsa_playback_device, sizeof(tx->alsa_playback_device), "null");
-    tx->capture_pipeline = make_raw_capture_pipeline(&tx->capture_sink, "null");
+    tx->capture_pipeline = make_raw_capture_pipeline(&tx->capture_sink, "null", 0);
     tx->playback_pipeline = make_playback_pipeline(&tx->playback_src, "null");
     assert(tx->capture_pipeline && tx->playback_pipeline);
     ptt_jitter_init(&tx->jitter, 40, 1);
