@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include <arpa/inet.h>
+#include <alsa/asoundlib.h>
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -111,8 +112,9 @@ typedef struct {
     double mic_gain_multiplier;
     uint64_t mic_clipped_samples;
     int64_t mic_clip_warning_ms;
-    unsigned capture_generation;
-    int capture_active;
+    atomic_int capture_active;
+    pthread_t capture_thread;
+    GstElement *usb_capture_src;
     int pc_ptt_hold_ms;
     char txid[TALK_ID_MAX + 1];
     unsigned char key[KEY_LEN];
@@ -439,8 +441,8 @@ static GstPadProbeReturn mic_gain_probe(GstPad *pad, GstPadProbeInfo *info, gpoi
         fprintf(stderr, "microphone gain: cannot map capture PCM\n");
         return GST_PAD_PROBE_DROP;
     }
-    /* Encoded capture negotiates S16LE; raw preamble capture uses native S16. */
-    apply_mic_gain(app, map.data, map.size, !app->preamble_enabled || G_BYTE_ORDER == G_LITTLE_ENDIAN);
+    /* Legacy encoded capture uses S16LE; USB and raw capture use native S16. */
+    apply_mic_gain(app, map.data, map.size, (!app->preamble_enabled && !app->usbptt) || G_BYTE_ORDER == G_LITTLE_ENDIAN);
     gst_buffer_unmap(buffer, &map);
     return GST_PAD_PROBE_OK;
 }
@@ -541,7 +543,7 @@ static void report_rx_stats(app_t *app) {
     ptt_rx_stats_t r = app->jitter.stats;
     unsigned long long telemetry_drops = app->jitter.event_drops;
     pthread_mutex_unlock(&app->jitter_lock);
-    printf("audio stats: accepted=%llu decoded=%llu missing=%llu fec_attempts=%llu plc=%llu late=%llu duplicate=%llu reordered=%llu invalid=%llu overflow=%llu rebuffer=%llu timeouts=%llu jitter_ms=%.1f suppressed=%lu queue_drops=%lu scheduling_late=%lu audio_errors=%lu audio_warnings=%lu stream_failed_warnings=%lu capture_gaps=%lu tx_audio=%lu rx_audio=%lu auth_fail=%lu telemetry_drops=%llu\n",
+    printf("audio stats: accepted=%llu decoded=%llu missing=%llu fec_attempts=%llu plc=%llu late=%llu duplicate=%llu reordered=%llu invalid=%llu overflow=%llu rebuffer=%llu timeouts=%llu jitter_ms=%.1f suppressed=%lu queue_drops=%lu scheduling_late=%lu audio_errors=%lu audio_warnings=%lu stream_failed_warnings=%lu capture_gaps=%lu tx_audio=%lu tx_idle=%lu rx_audio=%lu auth_fail=%lu telemetry_drops=%llu\n",
         (unsigned long long)r.accepted, (unsigned long long)r.decoded,
         (unsigned long long)r.missing, (unsigned long long)r.fec_attempts,
         (unsigned long long)r.plc, (unsigned long long)r.late,
@@ -552,7 +554,7 @@ static void report_rx_stats(app_t *app) {
         atomic_load(&app->rx_suppressed_packets), atomic_load(&app->playback_queue_drops),
         atomic_load(&app->playback_schedule_late), atomic_load(&app->playback_errors),
         atomic_load(&app->playback_warnings), atomic_load(&app->playback_starvations),
-        atomic_load(&app->tx_capture_gaps), atomic_load(&app->tx_audio_packets),
+        atomic_load(&app->tx_capture_gaps), atomic_load(&app->tx_audio_packets), atomic_load(&app->tx_idle_packets),
         atomic_load(&app->rx_audio_packets), atomic_load(&app->rx_decrypt_failures), telemetry_drops);
     fflush(stdout);
 }
@@ -782,33 +784,87 @@ static void finish_tx_session(app_t *app) {
     for (int i = 0; i < 3; ++i) send_packet(app, PKT_END, NULL, 0);
 }
 
-/* Only the sender changes USB capture state. NULL releases the ALSA device;
- * a generation is attempted once, even if hardware EIO precedes F2 release. */
-static void update_usb_capture(app_t *app) {
-    if (!app->usbptt || !app->capture_pipeline) return;
-    unsigned generation = atomic_load(&app->ptt_generation);
-    int pressed = app->ptt_enabled && atomic_load(&app->ptt_pressed);
-    GstBus *bus = gst_element_get_bus(app->capture_pipeline);
-    GstMessage *error = gst_bus_pop_filtered(bus, GST_MESSAGE_ERROR);
-    if (app->capture_active && (!pressed || generation != app->capture_generation || error)) {
-        gst_element_set_state(app->capture_pipeline, GST_STATE_NULL);
-        app->capture_active = 0;
+/* This worker exclusively owns the ALSA handle. Neither network thread waits
+ * for device setup/teardown. Nonblocking reads avoid the QX-18 release-time
+ * mmap read stall in GStreamer's alsasrc ring-buffer shutdown. */
+static void *usb_capture_thread_main(void *arg) {
+    app_t *app = arg;
+    snd_pcm_t *pcm = NULL;
+    int16_t samples[PTT_SAMPLES] = {0};
+    size_t filled = 0;
+    unsigned attempted = 0;
+    while (atomic_load(&app->running)) {
+        unsigned generation = atomic_load(&app->ptt_generation);
+        int pressed = app->ptt_enabled && atomic_load(&app->ptt_pressed);
+        if (pcm && (!pressed || generation != attempted)) {
+            atomic_store(&app->capture_active, 0);
+            snd_pcm_drop(pcm); snd_pcm_close(pcm); pcm = NULL; filled = 0;
+        }
+        if (!pressed || (!pcm && generation == attempted)) { msleep_int(5); continue; }
+        if (!pcm) {
+            attempted = generation;
+            int error = snd_pcm_open(&pcm, app->alsa_capture_device, SND_PCM_STREAM_CAPTURE, SND_PCM_NONBLOCK);
+            if (error >= 0) error = snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16, SND_PCM_ACCESS_RW_INTERLEAVED, 1, 48000, 1, 40000);
+            if (error < 0) {
+                fprintf(stderr, "USB PTT capture could not start: %s; release PTT and retry\n", snd_strerror(error));
+                if (pcm) { snd_pcm_close(pcm); pcm = NULL; }
+                continue;
+            }
+            filled = 0;
+            atomic_store(&app->capture_active, 1);
+        }
+        snd_pcm_sframes_t n = snd_pcm_readi(pcm, samples + filled, PTT_SAMPLES - filled);
+        if (n == -EAGAIN || n == -EINTR || n == 0) { msleep_int(5); continue; }
+        if (n == -EPIPE) {
+            filled = 0; atomic_fetch_add(&app->tx_capture_gaps, 1);
+            if (snd_pcm_prepare(pcm) >= 0) continue;
+        }
+        if (n < 0) {
+            fprintf(stderr, "USB PTT capture stopped: %s; release PTT and retry\n", snd_strerror((int)n));
+            atomic_fetch_add(&app->playback_errors, 1);
+            atomic_store(&app->capture_active, 0);
+            snd_pcm_drop(pcm); snd_pcm_close(pcm); pcm = NULL; filled = 0;
+            continue;
+        }
+        filled += (size_t)n;
+        if (filled < PTT_SAMPLES) continue;
+        if (atomic_load(&app->ptt_pressed) && generation == atomic_load(&app->ptt_generation)) {
+            GstBuffer *buffer = gst_buffer_new_allocate(NULL, sizeof(samples), NULL);
+            gst_buffer_fill(buffer, 0, samples, sizeof(samples));
+            GST_BUFFER_DURATION(buffer) = PTT_FRAME_MS * GST_MSECOND;
+            gst_app_src_push_buffer(GST_APP_SRC(app->usb_capture_src), buffer);
+        }
+        filled = 0;
+        /* Bound synthetic/unpaced ALSA sources as well as real hardware. */
+        msleep_int(1);
     }
-    if (error) {
-        GError *detail = NULL; gchar *debug = NULL;
-        gst_message_parse_error(error, &detail, &debug);
-        fprintf(stderr, "USB PTT capture stopped: %s; release PTT and retry\n", detail ? detail->message : "audio error");
-        atomic_fetch_add(&app->playback_errors, 1);
-        g_clear_error(&detail); g_free(debug); gst_message_unref(error);
+    atomic_store(&app->capture_active, 0);
+    if (pcm) { snd_pcm_drop(pcm); snd_pcm_close(pcm); }
+    return NULL;
+}
+
+static GstElement *make_usb_capture_pipeline(app_t *app) {
+    char desc[1024]; GError *error = NULL;
+    snprintf(desc, sizeof(desc),
+        "appsrc name=usb_capture is-live=true format=time do-timestamp=true block=false max-buffers=8 max-bytes=0 max-time=0 leaky-type=downstream ! "
+        "identity name=mic_gain ! %s appsink name=capture_sink sync=false max-buffers=8 drop=true",
+        app->preamble_enabled ? "" : "audioconvert ! audioresample ! opusenc name=encoder frame-size=20 bitrate=24000 audio-type=voice !");
+    GstElement *pipeline = gst_parse_launch(desc, &error);
+    if (!pipeline || error) {
+        fprintf(stderr, "USB capture pipeline: %s\n", error ? error->message : "creation failed");
+        g_clear_error(&error); if (pipeline) gst_object_unref(pipeline); return NULL;
     }
-    if (pressed && generation != app->capture_generation) {
-        app->capture_generation = generation;
-        if (gst_element_set_state(app->capture_pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
-            fprintf(stderr, "USB PTT capture could not start; release PTT and retry\n");
-            gst_element_set_state(app->capture_pipeline, GST_STATE_NULL);
-        } else app->capture_active = 1;
+    app->usb_capture_src = gst_bin_get_by_name(GST_BIN(pipeline), "usb_capture");
+    app->capture_sink = gst_bin_get_by_name(GST_BIN(pipeline), "capture_sink");
+    GstCaps *caps = gst_caps_new_simple("audio/x-raw", "format", G_TYPE_STRING, GST_AUDIO_NE(S16),
+        "layout", G_TYPE_STRING, "interleaved", "rate", G_TYPE_INT, 48000, "channels", G_TYPE_INT, 1, NULL);
+    g_object_set(app->usb_capture_src, "caps", caps, NULL); gst_caps_unref(caps);
+    if (!app->preamble_enabled) {
+        GstElement *encoder = gst_bin_get_by_name(GST_BIN(pipeline), "encoder");
+        g_object_set(encoder, "inband-fec", app->fec_enabled, "packet-loss-percentage", app->loss_percent, NULL);
+        gst_object_unref(encoder);
     }
-    gst_object_unref(bus);
+    return pipeline;
 }
 
 static void *send_preamble_thread(void *arg);
@@ -820,7 +876,6 @@ static void *send_thread_main(void *arg) {
     int transmitting = 0;
     GstClockTime last_pts = GST_CLOCK_TIME_NONE;
     while (atomic_load(&app->running)) {
-        update_usb_capture(app);
         unsigned current = atomic_load(&app->ptt_generation);
         int pressed = app->ptt_enabled && atomic_load(&app->ptt_pressed);
         if (transmitting && (!pressed || current != generation)) {
@@ -953,7 +1008,6 @@ static void *send_preamble_thread(void *arg) {
     int64_t due = mono_ms(), monitor_deadline = 0;
     GstClockTime capture_end = GST_CLOCK_TIME_NONE;
     while (atomic_load(&app->running)) {
-        update_usb_capture(app);
         int pressed = atomic_load(&app->ptt_pressed);
         unsigned current = atomic_load(&app->ptt_generation);
         if (active && (!pressed || current != generation)) {
@@ -1149,10 +1203,12 @@ static void cleanup(app_t *app) {
     if (app->key_thread) pthread_join(app->key_thread, NULL);
     if (app->ctrl_thread) pthread_join(app->ctrl_thread, NULL);
     if (app->send_thread) pthread_join(app->send_thread, NULL);
+    if (app->capture_thread) pthread_join(app->capture_thread, NULL);
     if (app->recv_thread) pthread_join(app->recv_thread, NULL);
     if (app->play_thread) pthread_join(app->play_thread, NULL);
     report_rx_stats(app);
     ptt_jitter_destroy(&app->jitter);
+    if (app->usb_capture_src) gst_object_unref(app->usb_capture_src);
     if (app->capture_pipeline) { gst_element_set_state(app->capture_pipeline, GST_STATE_NULL); if (app->capture_sink) gst_object_unref(app->capture_sink); gst_object_unref(app->capture_pipeline); }
     if (app->playback_pipeline) { gst_element_set_state(app->playback_pipeline, GST_STATE_NULL); if (app->playback_src) { gst_app_src_end_of_stream(GST_APP_SRC(app->playback_src)); gst_object_unref(app->playback_src); } gst_object_unref(app->playback_pipeline); }
     if (app->telemetry_fd >= 0) { close(app->telemetry_fd); app->telemetry_fd = -1; }
@@ -1308,12 +1364,12 @@ int main(int argc, char **argv) {
 
     if (g_app.ptt_socket_enabled) { g_app.ptt_ctrl_sock = make_ptt_control_socket(g_app.ptt_socket_path); if (g_app.ptt_ctrl_sock < 0) { cleanup(&g_app); return 1; } }
     if (!PTT_WAV_GATE && g_app.ptt_enabled) {
-        g_app.capture_pipeline = g_app.preamble_enabled
+        g_app.capture_pipeline = g_app.usbptt ? make_usb_capture_pipeline(&g_app) : g_app.preamble_enabled
             ? make_raw_capture_pipeline(&g_app.capture_sink, g_app.alsa_capture_device, 1)
             : make_capture_pipeline(&g_app.capture_sink, g_app.alsa_capture_device, g_app.fec_enabled, g_app.loss_percent, 1);
         if (!g_app.capture_pipeline) { cleanup(&g_app); return 1; }
         install_mic_gain(&g_app);
-        if (!g_app.usbptt) gst_element_set_state(g_app.capture_pipeline, GST_STATE_PLAYING);
+        gst_element_set_state(g_app.capture_pipeline, GST_STATE_PLAYING);
     }
     if (!PTT_WAV_GATE && !g_app.blackfiber_tx_only) {
         g_app.playback_pipeline = make_playback_pipeline(&g_app.playback_src, g_app.alsa_playback_device);
@@ -1345,12 +1401,17 @@ int main(int argc, char **argv) {
     if (PTT_WAV_GATE) printf("WAV input: %s; output: %s\n", wav_input, wav_output);
     else {
     printf("ptt input: %s\n", g_app.usbptt ? "USB PTT (KEY_F2), capture opens on press" : g_app.codec_ptt_enabled ? "codec-ptt (KEY_ENTER)" : "keyboard Right Alt / AltGr"); if (!g_app.codec_ptt_enabled && !g_app.usbptt) printf("altgr ptt delay: %d ms\n", g_app.pc_ptt_hold_ms); if (g_app.ptt_socket_enabled) printf("ptt socket: %s\n", g_app.ptt_socket_path); if (g_app.state_file_enabled) printf("ptt state file: %s (rx timeout=%d ms)\n", g_app.state_file_path, g_app.rx_state_timeout_ms);
-    if (g_app.alsa_capture_device[0]) printf("capture: alsasrc device=\"%s\"\n", g_app.alsa_capture_device); else printf("capture: autoaudiosrc\n");
+    if (g_app.alsa_capture_device[0]) printf("capture: %s device=\"%s\"\n", g_app.usbptt ? "nonblocking ALSA worker" : "alsasrc", g_app.alsa_capture_device); else printf("capture: autoaudiosrc\n");
     if (g_app.alsa_playback_device[0]) printf("playback: alsasink device=\"%s\"\n", g_app.alsa_playback_device); else printf("playback: autoaudiosink\n"); fflush(stdout);
     if (g_app.ptt_enabled) { if (pthread_create(&g_app.key_thread, NULL, keyboard_thread_main, &g_app) != 0) { perror("pthread_create(key_thread)"); cleanup(&g_app); return 1; } }
     }
     fflush(stdout);
     if (g_app.ptt_socket_enabled) { if (pthread_create(&g_app.ctrl_thread, NULL, ptt_control_thread_main, &g_app) != 0) { perror("pthread_create(ctrl_thread)"); cleanup(&g_app); return 1; } }
+    if (g_app.usbptt && g_app.ptt_enabled) {
+        if (pthread_create(&g_app.capture_thread, NULL, usb_capture_thread_main, &g_app) != 0) {
+            perror("pthread_create(USB capture)"); cleanup(&g_app); return 1;
+        }
+    }
     if (!(g_app.transport_mode == TRANSPORT_BLACKFIBER && g_app.blackfiber_rx_passive)) {
         if (pthread_create(&g_app.send_thread, NULL, PTT_WAV_GATE ? wav_send_thread : send_thread_main, &g_app) != 0) {
             perror("pthread_create(send_thread)");
@@ -1373,7 +1434,7 @@ int main(int argc, char **argv) {
     int64_t next_report = mono_ms() + 5000;
     while (atomic_load(&g_app.running)) {
         output_telemetry(&g_app);
-        if (!g_app.usbptt) check_audio_bus(&g_app, g_app.capture_pipeline);
+        check_audio_bus(&g_app, g_app.capture_pipeline);
         if (mono_ms() >= next_report) { report_rx_stats(&g_app); next_report = mono_ms() + 5000; }
         msleep_int(100);
     }

@@ -1,8 +1,31 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+#include <alsa/asoundlib.h>
+#include <stdatomic.h>
+static atomic_int usb_test_mode, usb_test_close_entered, usb_test_allow_close;
+static snd_pcm_sframes_t test_usb_read(snd_pcm_t *pcm, void *buffer, snd_pcm_uframes_t size);
+static int test_usb_close(snd_pcm_t *pcm);
+#define snd_pcm_readi test_usb_read
+#define snd_pcm_close test_usb_close
 #define main ptt_client_program_main
 #include "../ptt_client.c"
 #undef main
+#undef snd_pcm_readi
+#undef snd_pcm_close
 #include <assert.h>
+
+static snd_pcm_sframes_t test_usb_read(snd_pcm_t *pcm, void *buffer, snd_pcm_uframes_t size) {
+    int mode = atomic_load(&usb_test_mode);
+    if (mode == 2) return -EIO;
+    if (mode == 3) return -EAGAIN;
+    return snd_pcm_readi(pcm, buffer, size);
+}
+static int test_usb_close(snd_pcm_t *pcm) {
+    if (atomic_load(&usb_test_mode) == 2) {
+        atomic_store(&usb_test_close_entered, 1);
+        while (!atomic_load(&usb_test_allow_close)) msleep_int(1);
+    }
+    return snd_pcm_close(pcm);
+}
 
 static packet_hdr_t wait_type(int sock, unsigned type) {
     int64_t deadline = mono_ms() + 2000;
@@ -70,9 +93,89 @@ static void test_mic_gain(void) {
     gst_object_unref(src); gst_object_unref(sink); gst_object_unref(pipeline);
 }
 
+static void test_usb_idle_recovery(void) {
+    for (int preamble = 0; preamble < 2; preamble++) {
+        app_t *app = calloc(1, sizeof(*app)); assert(app);
+        pthread_mutex_init(&app->jitter_lock, NULL); pthread_mutex_init(&app->state_lock, NULL);
+        ptt_jitter_init(&app->jitter, 40, 0);
+        int pair[2]; assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) == 0);
+        struct timeval timeout = {.tv_usec = 20000};
+        assert(setsockopt(pair[0], SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
+        assert(setsockopt(pair[1], SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
+        app->sock = pair[0]; app->usbptt = app->ptt_enabled = 1; app->preamble_enabled = preamble;
+        strcpy(app->alsa_capture_device, "null"); strcpy(app->alsa_playback_device, "null");
+        strcpy(app->txid, "usbtest"); assert(tm_id(app->telemetry_tx.id, "ALPHA"));
+        app->capture_pipeline = make_usb_capture_pipeline(app); assert(app->capture_pipeline);
+        app->mic_gain_db = 6; app->mic_gain_multiplier = pow(10.0, 6.0 / 20.0);
+        install_mic_gain(app);
+        gst_element_set_state(app->capture_pipeline, GST_STATE_PLAYING);
+        atomic_store(&usb_test_mode, 1); atomic_store(&usb_test_close_entered, 0); atomic_store(&usb_test_allow_close, 0);
+        atomic_store(&app->running, 1);
+        assert(pthread_create(&app->capture_thread, NULL, usb_capture_thread_main, app) == 0);
+        assert(pthread_create(&app->send_thread, NULL, send_thread_main, app) == 0);
+        assert(pthread_create(&app->recv_thread, NULL, recv_thread_main, app) == 0);
+        wait_type(pair[1], PKT_IDLE); assert(!atomic_load(&app->capture_active));
+        set_ptt_state(app, 1); wait_type(pair[1], PKT_AUDIO);
+        /* EIO leads to deliberately stalled teardown. Network must progress
+         * before the test permits teardown to finish, in both sender modes. */
+        atomic_store(&usb_test_mode, 2);
+        int64_t deadline = mono_ms() + 2000;
+        while (!atomic_load(&usb_test_close_entered) && mono_ms() < deadline) msleep_int(1);
+        assert(atomic_load(&usb_test_close_entered));
+        set_ptt_state(app, 0);
+        wait_type(pair[1], PKT_END); wait_type(pair[1], PKT_IDLE);
+        unsigned long idle = atomic_load(&app->tx_idle_packets);
+        msleep_int(100); assert(atomic_load(&app->tx_idle_packets) > idle);
+        app_t remote = {0}; remote.sock = pair[1]; strcpy(remote.txid, "remote");
+        randombytes_buf(remote.tx_session, sizeof(remote.tx_session));
+        const uint8_t silence[] = {0xf8, 0xff, 0xfe};
+        assert(send_packet(&remote, PKT_AUDIO, silence, sizeof(silence)));
+        deadline = mono_ms() + 1000;
+        while (!atomic_load(&app->rx_audio_packets) && mono_ms() < deadline) msleep_int(1);
+        assert(atomic_load(&app->rx_audio_packets) == 1);
+        atomic_store(&usb_test_allow_close, 1);
+        /* A silent nonblocking device must also release without a new press. */
+        atomic_store(&usb_test_mode, 3); set_ptt_state(app, 1);
+        deadline = mono_ms() + 1000;
+        while (!atomic_load(&app->capture_active) && mono_ms() < deadline) msleep_int(1);
+        assert(atomic_load(&app->capture_active));
+        set_ptt_state(app, 0);
+        deadline = mono_ms() + 1000;
+        while (atomic_load(&app->capture_active) && mono_ms() < deadline) msleep_int(1);
+        assert(!atomic_load(&app->capture_active));
+        /* EIO must not trigger automatic reopen while the same press is held. */
+        set_ptt_state(app, 1);
+        deadline = mono_ms() + 1000;
+        while (!atomic_load(&app->capture_active) && mono_ms() < deadline) msleep_int(1);
+        assert(atomic_load(&app->capture_active));
+        unsigned long errors = atomic_load(&app->playback_errors);
+        atomic_store(&usb_test_mode, 2);
+        deadline = mono_ms() + 1000;
+        while (atomic_load(&app->capture_active) && mono_ms() < deadline) msleep_int(1);
+        assert(!atomic_load(&app->capture_active));
+        msleep_int(50);
+        assert(atomic_load(&app->playback_errors) == errors + 1);
+        atomic_store(&usb_test_mode, 3);
+        msleep_int(20); assert(!atomic_load(&app->capture_active));
+        set_ptt_state(app, 0); set_ptt_state(app, 1);
+        deadline = mono_ms() + 1000;
+        while (!atomic_load(&app->capture_active) && mono_ms() < deadline) msleep_int(1);
+        assert(atomic_load(&app->capture_active));
+        /* Exit while capture is returning EAGAIN, without a hardware wakeup. */
+        atomic_store(&app->running, 0);
+        pthread_join(app->send_thread, NULL); pthread_join(app->capture_thread, NULL); pthread_join(app->recv_thread, NULL);
+        gst_element_set_state(app->capture_pipeline, GST_STATE_NULL);
+        gst_object_unref(app->usb_capture_src); gst_object_unref(app->capture_sink); gst_object_unref(app->capture_pipeline);
+        ptt_jitter_destroy(&app->jitter); pthread_mutex_destroy(&app->jitter_lock); pthread_mutex_destroy(&app->state_lock);
+        close(pair[0]); close(pair[1]); free(app);
+    }
+    atomic_store(&usb_test_mode, 0);
+}
+
 int main(int argc, char **argv) {
     gst_init(&argc, &argv); assert(sodium_init() >= 0);
     test_mic_gain();
+    test_usb_idle_recovery();
     app_t *tx = calloc(1, sizeof(*tx)), *rx = calloc(1, sizeof(*rx));
     assert(tx && rx);
     pthread_mutex_init(&tx->jitter_lock, NULL);
@@ -178,41 +281,6 @@ int main(int argc, char **argv) {
     atomic_store(&tx->running, 0); pthread_join(tx->send_thread, NULL);
     gst_element_set_state(capture, GST_STATE_NULL);
     gst_object_unref(capture_sink); gst_object_unref(capture);
-
-    /* Deferred USB capture stays NULL while idle, closes on release/error,
-     * and only retries after a fresh press (also covers raw preamble capture). */
-    for (int raw = 0; raw < 2; raw++) {
-        tx->usbptt = 1; tx->capture_generation = 0; tx->capture_active = 0;
-        tx->capture_pipeline = raw ? make_raw_capture_pipeline(&tx->capture_sink, "null", 1)
-            : make_capture_pipeline(&tx->capture_sink, "null", 1, 10, 1);
-        tx->preamble_enabled = raw;
-        tx->mic_gain_db = 6; tx->mic_gain_multiplier = pow(10.0, 6.0 / 20.0);
-        install_mic_gain(tx);
-        GstState state;
-        update_usb_capture(tx);
-        gst_element_get_state(tx->capture_pipeline, &state, NULL, GST_SECOND);
-        assert(state == GST_STATE_NULL && !tx->capture_active);
-        set_ptt_state(tx, 1); update_usb_capture(tx);
-        assert(tx->capture_active);
-        sample = gst_app_sink_try_pull_sample(GST_APP_SINK(tx->capture_sink), 2 * GST_SECOND);
-        assert(sample); gst_sample_unref(sample);
-        GError *error = g_error_new_literal(GST_RESOURCE_ERROR, GST_RESOURCE_ERROR_READ, "simulated USB release EIO");
-        assert(gst_element_post_message(tx->capture_pipeline,
-            gst_message_new_error(GST_OBJECT(tx->capture_pipeline), error, "test")));
-        g_error_free(error);
-        update_usb_capture(tx); assert(!tx->capture_active);
-        update_usb_capture(tx); assert(!tx->capture_active);
-        set_ptt_state(tx, 0); update_usb_capture(tx);
-        set_ptt_state(tx, 1); update_usb_capture(tx); assert(tx->capture_active);
-        sample = gst_app_sink_try_pull_sample(GST_APP_SINK(tx->capture_sink), 2 * GST_SECOND);
-        assert(sample); gst_sample_unref(sample);
-        set_ptt_state(tx, 0); update_usb_capture(tx);
-        gst_element_get_state(tx->capture_pipeline, &state, NULL, GST_SECOND);
-        assert(state == GST_STATE_NULL && !tx->capture_active);
-        gst_object_unref(tx->capture_sink); gst_object_unref(tx->capture_pipeline);
-        tx->capture_sink = tx->capture_pipeline = NULL;
-    }
-    tx->usbptt = 0; tx->preamble_enabled = 0; tx->mic_gain_db = 0;
 
     /* GPS is an atomic snapshot file; missing/stale/malformed fixes fall back
      * to ID only rather than emitting a fabricated coordinate. */

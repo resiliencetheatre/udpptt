@@ -187,7 +187,7 @@ Packages typically needed on Debian/Ubuntu:
 
 ```sh
 sudo apt install build-essential pkg-config libsodium-dev libopus-dev \
-    libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+    libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libasound2-dev \
     gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
     gstreamer1.0-plugins-bad gstreamer1.0-tools gstreamer1.0-alsa
 ```
@@ -661,8 +661,14 @@ Use `--usbptt` for microphones such as the tested QX-18 / UACDemoV1.0
 ```
 
 This selects immediate F2 press/release PTT, ignoring autorepeat. Capture stays
-closed at startup, opens on a press, and closes on release. Release is processed
-by the sender after its current bounded audio wait (up to 50 ms). Capture errors
+closed at startup, opens on a press, and closes on release. USB capture uses a
+dedicated ALSA worker with nonblocking reads and 5 ms waits when no samples are
+available. It feeds a bounded GStreamer queue for gain and encoding. The sender
+handles release after its current bounded audio wait (up to 50 ms), independently
+of capture teardown. END packets and idle keepalives therefore continue even if
+device teardown stalls; `tx_idle` in the five-second statistics shows successful
+idle sends. This avoids the QX-18 release-time GStreamer `alsasrc` shutdown stall
+that could stop keepalives and expire the relay's client registration. Capture errors
 (including the hardware's release-time EIO) close capture without exiting or
 repeatedly reopening it while held; release and press again to retry. Very short
 taps may produce no audio. Preamble mode is supported and still gates speech
@@ -701,8 +707,12 @@ to start at program startup as before.
 
 Desk verification: try long holds, short taps, repeated presses, release-time
 errors, unplugging while held, and Ctrl+C. Confirm audio reaches a second client
-and that the next press works after each release. Automated tests use ALSA's
-null device; they do not establish USB hardware compatibility.
+and that the next press works after each release. After transmitting, leave PTT
+released for several minutes and verify that `tx_idle` keeps increasing and
+remote speech still updates RX state and plays. Automated tests use ALSA's
+null device plus injected EIO, empty reads, and stalled teardown; they verify
+END/idle delivery and reception during the stall in both normal and preamble
+modes, but do not establish USB hardware compatibility.
 
 - The `--codec-ptt` option switches PTT input handling to **KEY_ENTER**.
 - This is intended for embedded or codec-board GPIO/button input devices such as `ptt_keys`.

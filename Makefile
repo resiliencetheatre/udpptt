@@ -26,8 +26,11 @@ SODIUM_LIBS   := $(shell pkg-config --libs libsodium 2>/dev/null)
 OPUS_CFLAGS := $(shell pkg-config --cflags opus 2>/dev/null)
 OPUS_LIBS := $(shell pkg-config --libs opus 2>/dev/null)
 
-CLIENT_CFLAGS := $(GST_CFLAGS) $(SODIUM_CFLAGS) $(OPUS_CFLAGS)
-CLIENT_LIBS   := $(GST_LIBS) $(SODIUM_LIBS) $(OPUS_LIBS)
+ALSA_CFLAGS := $(shell pkg-config --cflags alsa 2>/dev/null)
+ALSA_LIBS := $(shell pkg-config --libs alsa 2>/dev/null)
+
+CLIENT_CFLAGS := $(ALSA_CFLAGS) $(GST_CFLAGS) $(SODIUM_CFLAGS) $(OPUS_CFLAGS)
+CLIENT_LIBS   := $(ALSA_LIBS) $(GST_LIBS) $(SODIUM_LIBS) $(OPUS_LIBS)
 
 TARGETS = ptt_wav_gate ptt_client ptt_server ptt_helper ptt_hid
 DATAFILES = start.wav stop.wav
