@@ -1496,6 +1496,8 @@ GPS input, event format, reproducible experiments and current limitations.
 
 ## Optional DPI source attribution
 
+![UDPPTT DPI metadata and signature verification in Wireshark](img/wireshark.png)
+
 `ptt_client` and `ptt_wav_gate` accept `--dpi-id LABEL` to wrap every outgoing
 PTT audio, idle and end packet in the metadata-proxy-compatible MDPX v1 format.
 The label is cleartext (1–63 ASCII letters, digits, dots, underscores or hyphens).
@@ -1525,6 +1527,34 @@ created automatically during normal startup and none are bundled with UDPPTT.
 Observers map the public key to the label using a trusted channel and can
 verify captures with the [Wireshark plugin](wireshark/README.md). The original
 metadata-proxy UDP plugin and `inspect` command also understand these packets.
+
+Create an observer `trusted.txt` with one **public key and DPI label** per line:
+
+```text
+PUBLIC_KEY_HEX LABEL
+```
+
+The label can be a hostname, but it must match the sender's `--dpi-id` exactly,
+including case. It is not automatically taken from the hostname, `--txid`, or
+`--preamble-id`. For example, if desk runs with `--dpi-id desk` and dell runs
+with `--dpi-id DELL`, copy their `dpi.public` files to the observer as
+`desk.public` and `dell.public`, then form the trust file:
+
+```sh
+awk '{print $0 " desk"}' desk.public > trusted.txt
+awk '{print $0 " DELL"}' dell.public >> trusted.txt
+```
+
+Each resulting line contains the host's 64-character public key, a space, and
+its label. Public keys alone are invalid: missing labels cause **Trust
+configuration error** and the plugin rejects the entire trust file. Never put
+private `dpi.secret` contents in this file.
+
+In **Wireshark → Preferences → Protocols → MDPX**, set **Public-key trust file**
+to the absolute path of `trusted.txt`. Set the UDP port to **5000** (or your
+configured PTT port), or use **Decode As → UDP port → MDPX**. After editing the
+trust file, reopen the capture or restart live capture to reload it.
+
 A valid signature attributes the packet to the signing-key holder, not to a
 physical location or the observed IP/MAC address. Observers do not need the
 PTT encryption password. Historical/replayed packets still have valid signatures.
