@@ -19,6 +19,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <sodium.h>
+#include "ptt_dpi.h"
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -95,8 +96,13 @@ typedef struct {
     int blackfiber_tx_only;
     struct sockaddr_in server_addr;
     char bf_ifname[IFNAMSIZ];
+    const char *dpi_id, *dpi_secret;
+    unsigned char dpi_pk[32], dpi_sk[64], dpi_session[16];
+    uint64_t dpi_sequence;
+    struct workspace dpi_workspace;
+    pthread_mutex_t dpi_lock;
     uint16_t bf_ethertype;
-    int bf_ifindex;
+    int bf_ifindex, dpi_mtu;
     uint8_t bf_local_mac[ETH_ALEN];
     uint8_t bf_dst_mac[ETH_ALEN];
     atomic_int running;
@@ -387,6 +393,10 @@ static int make_blackfiber_socket(app_t *app) {
     snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s", app->bf_ifname);
     if (ioctl(fd, SIOCGIFINDEX, &ifr) < 0) { perror("ioctl(SIOCGIFINDEX)"); close(fd); return -1; }
     app->bf_ifindex = ifr.ifr_ifindex;
+    if (app->dpi_id) {
+        if (ioctl(fd, SIOCGIFMTU, &ifr) < 0) { perror("SIOCGIFMTU"); close(fd); return -1; }
+        app->dpi_mtu = ifr.ifr_mtu;
+    }
 
     memset(&ifr, 0, sizeof(ifr));
     snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s", app->bf_ifname);
@@ -502,39 +512,55 @@ static bool send_packet(app_t *app, uint8_t type, const uint8_t *payload, uint16
         wire_payload = cipher;
     }
 
+    uint8_t buf[MAX_PACKET];
+    uint8_t inner[MAX_PACKET];
+    size_t size = sizeof(hdr) + (size_t)wire_len;
+    if (size > sizeof(inner)) return false;
+    memcpy(inner, &hdr, sizeof hdr);
+    if (wire_len) memcpy(inner + sizeof hdr, wire_payload, (size_t)wire_len);
+    const uint8_t *out = inner;
+    if (app->dpi_id) {
+        struct timespec now;
+        if (size + 115 + strlen(app->dpi_id) > sizeof buf ||
+            clock_gettime(CLOCK_REALTIME, &now) || now.tv_sec < 0) {
+            fprintf(stderr, "DPI packet too large or realtime clock unavailable\n");
+            return false;
+        }
+        pthread_mutex_lock(&app->dpi_lock);
+        int rc = app->dpi_sequence == UINT64_MAX ? -1 :
+            encode(&app->dpi_workspace, buf, &size, inner, size, app->dpi_id,
+                   app->dpi_pk, app->dpi_sk, app->dpi_session,
+                   (uint64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000,
+                   app->dpi_sequence++);
+        pthread_mutex_unlock(&app->dpi_lock);
+        if (rc) { fprintf(stderr, "DPI signing failed (restart if sequence exhausted)\n"); return false; }
+        out = buf;
+    }
     if (app->transport_mode == TRANSPORT_UDP) {
-        uint8_t buf[MAX_PACKET];
-        if (sizeof(hdr) + wire_len > sizeof(buf)) { fprintf(stderr, "packet too large: %llu\n", wire_len); return false; }
-        hdr.len = htons((uint16_t)wire_len);
-        memcpy(buf, &hdr, sizeof(hdr));
-        if (wire_len > 0 && wire_payload) memcpy(buf + sizeof(hdr), wire_payload, (size_t)wire_len);
-        ssize_t sent = send(app->sock, buf, sizeof(hdr) + (size_t)wire_len, 0); if (sent < 0) { perror("send"); return false; } return true;
+        ssize_t sent = send(app->sock, out, size, 0);
+        if (sent < 0) { perror("send"); return false; }
+        return (size_t)sent == size;
     } else {
         uint8_t frame[MAX_FRAME];
         bf_eth_hdr_t *eh = (bf_eth_hdr_t *)frame;
         struct sockaddr_ll sll;
-        size_t frame_len;
-
-        if (sizeof(*eh) + sizeof(hdr) + wire_len > sizeof(frame)) { fprintf(stderr, "blackfiber frame too large: %llu\n", wire_len); return false; }
-
+        if (sizeof(*eh) + size > sizeof frame) return false;
+        if (app->dpi_id && size > (size_t)app->dpi_mtu) {
+            fprintf(stderr, "DPI frame exceeds interface MTU\n"); return false;
+        }
         memcpy(eh->dst, app->bf_dst_mac, ETH_ALEN);
         memcpy(eh->src, app->bf_local_mac, ETH_ALEN);
         eh->ethertype = htons(app->bf_ethertype);
-
-        hdr.len = htons((uint16_t)wire_len);
-        memcpy(frame + sizeof(*eh), &hdr, sizeof(hdr));
-        if (wire_len > 0 && wire_payload) memcpy(frame + sizeof(*eh) + sizeof(hdr), wire_payload, (size_t)wire_len);
-        frame_len = sizeof(*eh) + sizeof(hdr) + (size_t)wire_len;
-
-        memset(&sll, 0, sizeof(sll));
+        memcpy(frame + sizeof(*eh), out, size);
+        size_t frame_len = sizeof(*eh) + size;
+        memset(&sll, 0, sizeof sll);
         sll.sll_family = AF_PACKET;
         sll.sll_ifindex = app->bf_ifindex;
         sll.sll_halen = ETH_ALEN;
         memcpy(sll.sll_addr, app->bf_dst_mac, ETH_ALEN);
-
-        ssize_t sent = sendto(app->sock, frame, frame_len, 0, (struct sockaddr *)&sll, sizeof(sll));
+        ssize_t sent = sendto(app->sock, frame, frame_len, 0, (struct sockaddr *)&sll, sizeof sll);
         if (sent < 0) { perror("sendto(AF_PACKET)"); return false; }
-        return true;
+        return (size_t)sent == frame_len;
     }
 }
 
@@ -1126,18 +1152,20 @@ static void output_telemetry(app_t *app) {
 
 static ssize_t recv_transport_packet(app_t *app, uint8_t *buf, size_t buf_sz) {
     if (app->transport_mode == TRANSPORT_UDP) {
-        return recv(app->sock, buf, buf_sz, 0);
+        ssize_t n = recv(app->sock, buf, buf_sz, MSG_TRUNC);
+        return n > (ssize_t)buf_sz ? -2 : n;
     } else {
         uint8_t frame[MAX_FRAME];
-        ssize_t n = recv(app->sock, frame, sizeof(frame), 0);
+        ssize_t n = recv(app->sock, frame, sizeof(frame), MSG_TRUNC);
         if (n <= 0) return n;
+        if ((size_t)n > sizeof(frame)) return -2;
         if ((size_t)n < sizeof(bf_eth_hdr_t)) return -2;
         bf_eth_hdr_t hdr;
         memcpy(&hdr, frame, sizeof(hdr));
         if (ntohs(hdr.ethertype) != app->bf_ethertype) return -2;
         if (memcmp(hdr.src, app->bf_local_mac, ETH_ALEN) == 0) return -2;
         size_t payload_len = (size_t)n - sizeof(bf_eth_hdr_t);
-        if (payload_len > buf_sz) payload_len = buf_sz;
+        if (payload_len > buf_sz) return -2;
         memcpy(buf, frame + sizeof(bf_eth_hdr_t), payload_len);
         return (ssize_t)payload_len;
     }
@@ -1154,16 +1182,21 @@ static void *recv_thread_main(void *arg) {
             }
             perror("recv"); break;
         }
+        const uint8_t *packet = buf;
+        size_t packet_size = (size_t)n;
+        if (ptt_dpi_unwrap(&packet, &packet_size, app->transport_mode != TRANSPORT_UDP) < 0) {
+            atomic_fetch_add(&app->rx_invalid_packets, 1); continue;
+        }
         packet_hdr_t hdr;
-        if ((size_t)n < sizeof(hdr)) { atomic_fetch_add(&app->rx_invalid_packets, 1); continue; }
-        memcpy(&hdr, buf, sizeof(hdr));
-        if (!ptt_header_valid(&hdr, (size_t)n)) {
+        if (packet_size < sizeof(hdr)) { atomic_fetch_add(&app->rx_invalid_packets, 1); continue; }
+        memcpy(&hdr, packet, sizeof(hdr));
+        if (!ptt_header_valid(&hdr, packet_size)) {
             unsigned long bad = atomic_fetch_add(&app->rx_invalid_packets, 1) + 1;
             if (bad == 1 || bad % 100 == 0) fprintf(stderr, "RX invalid/unsupported packet (protocol v2 required), count=%lu\n", bad);
             continue;
         }
         unsigned char plain[MAX_PACKET];
-        const uint8_t *opus = buf + sizeof(hdr);
+        const uint8_t *opus = packet + sizeof(hdr);
         unsigned long long len = ntohs(hdr.len);
         if (!!(hdr.flags & PKT_FLAG_ENCRYPTED) != !!app->encrypt_enabled) {
             atomic_fetch_add(&app->rx_decrypt_failures, 1); continue;
@@ -1216,7 +1249,9 @@ static void cleanup(app_t *app) {
     if (app->state_file_enabled) state_file_write_idle(app);
     if (app->ptt_socket_enabled && app->ptt_socket_path[0]) unlink(app->ptt_socket_path);
     sodium_memzero(app->key, sizeof(app->key));
+    sodium_memzero(app->dpi_sk, sizeof app->dpi_sk);
     printf("summary: tx_audio=%lu tx_idle=%lu rx_audio=%lu pcm_blocks_queued=%lu rx_idle_ignored=%lu decrypt_fail=%lu\n", (unsigned long)atomic_load(&app->tx_audio_packets), (unsigned long)atomic_load(&app->tx_idle_packets), (unsigned long)atomic_load(&app->rx_audio_packets), (unsigned long)atomic_load(&app->rx_played_packets), (unsigned long)atomic_load(&app->rx_ignored_idle_packets), (unsigned long)atomic_load(&app->rx_decrypt_failures));
+    pthread_mutex_destroy(&app->dpi_lock);
     pthread_mutex_destroy(&app->state_lock);
     pthread_mutex_destroy(&app->jitter_lock);
 }
@@ -1224,6 +1259,9 @@ static void cleanup(app_t *app) {
 #include "ptt_wav_io.h"
 
 static void usage(const char *argv0) {
+    fprintf(stderr, "DPI options: --dpi-id LABEL [--dpi-secret FILE]\n"
+            "  LABEL: 1..63 ASCII letters, digits, dot, underscore, hyphen.\n"
+            "  Default seed: ~/.config/udpptt/dpi.secret; create with ptt_dpi_keygen.\n");
     if (PTT_WAV_GATE) {
         fprintf(stderr, "usage: %s <server-ip> --input-dir DIR --output-dir DIR [client network options]\n"
                 "  --port PORT --txid NAME --encrypt --key PASSWORD --rx-only\n"
@@ -1246,13 +1284,23 @@ static void usage(const char *argv0) {
 }
 
 int main(int argc, char **argv) {
-    memset(&g_app, 0, sizeof(g_app)); pthread_mutex_init(&g_app.state_lock, NULL); pthread_mutex_init(&g_app.jitter_lock, NULL); g_app.jitter_ms = -1; g_app.loss_percent = 10; g_app.fec_enabled = 1; g_app.telemetry_fd = -1; g_app.sock = -1; g_app.ptt_ctrl_sock = -1; g_app.server_port = DEFAULT_SERVER_PORT; g_app.transport_mode = TRANSPORT_UDP; g_app.ptt_enabled = 1; g_app.pc_ptt_hold_ms = 2000; g_app.rx_state_timeout_ms = 1000; g_app.bf_ethertype = DEFAULT_BLACKFIBER_ETHERTYPE; memset(g_app.bf_dst_mac, 0xff, sizeof(g_app.bf_dst_mac)); snprintf(g_app.txid, sizeof(g_app.txid), "anon");
+    memset(&g_app, 0, sizeof(g_app)); pthread_mutex_init(&g_app.dpi_lock, NULL); pthread_mutex_init(&g_app.state_lock, NULL); pthread_mutex_init(&g_app.jitter_lock, NULL); g_app.jitter_ms = -1; g_app.loss_percent = 10; g_app.fec_enabled = 1; g_app.telemetry_fd = -1; g_app.sock = -1; g_app.ptt_ctrl_sock = -1; g_app.server_port = DEFAULT_SERVER_PORT; g_app.transport_mode = TRANSPORT_UDP; g_app.ptt_enabled = 1; g_app.pc_ptt_hold_ms = 2000; g_app.rx_state_timeout_ms = 1000; g_app.bf_ethertype = DEFAULT_BLACKFIBER_ETHERTYPE; memset(g_app.bf_dst_mac, 0xff, sizeof(g_app.bf_dst_mac)); snprintf(g_app.txid, sizeof(g_app.txid), "anon");
     const char *server_ip = NULL; const char *password = NULL;
     for (int i = 1; i < argc; ++i) {
         if (PTT_WAV_GATE && (!strcmp(argv[i], "--input-dir") || !strcmp(argv[i], "--output-dir"))) {
             int input = !strcmp(argv[i], "--input-dir");
             if (i + 1 >= argc || !argv[i+1][0] || strlen(argv[i+1]) >= PATH_MAX) return 1;
             copy_opt_string(input ? wav_input : wav_output, PATH_MAX, argv[++i]);
+        }
+        else if (!strcmp(argv[i], "--dpi-id")) {
+            if (++i >= argc || !label_valid((const unsigned char *)argv[i], strlen(argv[i]))) {
+                fprintf(stderr, "--dpi-id requires 1..63 characters [A-Za-z0-9._-]\n"); return 1;
+            }
+            g_app.dpi_id = argv[i];
+        }
+        else if (!strcmp(argv[i], "--dpi-secret")) {
+            if (++i >= argc || !argv[i][0]) { fprintf(stderr, "--dpi-secret requires FILE\n"); return 1; }
+            g_app.dpi_secret = argv[i];
         }
         else if (!strcmp(argv[i], "--help")) { usage(argv[0]); return 0; }
         else if (PTT_WAV_GATE && (!strncmp(argv[i], "--alsa-", 7) || !strcmp(argv[i], "--rpi-audio") || !strcmp(argv[i], "--mic-gain-db") ||
@@ -1352,12 +1400,37 @@ int main(int argc, char **argv) {
     if (g_app.ptt_socket_enabled && !g_app.ptt_socket_path[0]) { fprintf(stderr, "--ptt-socket requires a non-empty path\n"); return 1; }
     if (g_app.state_file_enabled && !g_app.state_file_path[0]) { fprintf(stderr, "--state-file requires a non-empty path\n"); return 1; }
     if (sodium_init() < 0) { fprintf(stderr, "libsodium init failed\n"); return 1; }
+    if (g_app.dpi_secret && !g_app.dpi_id) {
+        fprintf(stderr, "--dpi-secret requires --dpi-id\n"); return 1;
+    }
+    if (g_app.dpi_id) {
+        char default_path[4096];
+        const char *path = g_app.dpi_secret;
+        if (!path) {
+            const char *home = getenv("HOME");
+            if (!home || snprintf(default_path, sizeof default_path, "%s/.config/udpptt/dpi.secret", home) >= (int)sizeof default_path) {
+                fprintf(stderr, "Set --dpi-secret FILE (HOME unavailable or too long)\n"); return 1;
+            }
+            path = default_path;
+        }
+        if (secret_load(path, g_app.dpi_pk, g_app.dpi_sk)) {
+            fprintf(stderr, "Cannot load DPI signing seed: %s\n", path); return 1;
+        }
+        randombytes_buf(g_app.dpi_session, sizeof g_app.dpi_session);
+        printf("DPI signing enabled: label=%s\n", g_app.dpi_id);
+    }
     if (g_app.encrypt_enabled) { if (!password || !password[0]) password = getenv("UDPPTT_KEY"); if (!password || !password[0]) { fprintf(stderr, "--encrypt requires --key PASSWORD or UDPPTT_KEY\n"); return 1; } if (derive_key_from_password(password, g_app.key) != 0) return 1; }
 
     signal(SIGINT, on_sigint); signal(SIGTERM, on_sigint); gst_init(&argc, &argv);
 
     if (g_app.transport_mode == TRANSPORT_UDP) {
         g_app.sock = make_udp_socket(server_ip, g_app.server_port, &g_app.server_addr); if (g_app.sock < 0) return 1;
+        if (g_app.dpi_id) {
+            int mode = IP_PMTUDISC_DO;
+            if (setsockopt(g_app.sock, IPPROTO_IP, IP_MTU_DISCOVER, &mode, sizeof mode)) {
+                perror("DPI no-fragment socket option"); return 1;
+            }
+        }
     } else {
         g_app.sock = make_blackfiber_socket(&g_app); if (g_app.sock < 0) return 1;
     }

@@ -34,7 +34,7 @@ def write_wav(path, seconds=.4, rate=24000, channels=1):
         wav.writeframes(samples.tobytes())
 
 
-def run_case(encrypted):
+def run_case(encrypted, dpi=False):
     with tempfile.TemporaryDirectory(prefix='ptt-wav-test-') as root:
         root = Path(root)
         processes, logs = [], []
@@ -57,8 +57,13 @@ def run_case(encrypted):
             start([SERVER, '--port', str(port)], 'server')
             time.sleep(.1)
             crypto = ['--encrypt', '--key', 'test-word'] if encrypted else []
+            signing = []
+            if dpi:
+                subprocess.run(['./ptt_dpi_keygen', '--secret', str(root / 'dpi.secret'),
+                                '--public', str(root / 'dpi.public')], check=True)
+                signing = ['--dpi-id', 'GATE-TX', '--dpi-secret', str(root / 'dpi.secret')]
             receiver = start(gate('rx', crypto + ['--rx-only']), 'rx')
-            sender = start(gate('tx', crypto + (['--preamble-id', 'ABCDE'] if encrypted else [])), 'tx')
+            sender = start(gate('tx', crypto + signing + (['--preamble-id', 'ABCDE'] if encrypted else [])), 'tx')
             wait_for(lambda: (root / 'tx-in/sent').is_dir() and (root / 'rx-in/sent').is_dir(), processes)
             # Another queue owner must be rejected, and hardware flags rejected.
             duplicate = subprocess.run(gate('tx', crypto), capture_output=True, timeout=5)
@@ -152,4 +157,6 @@ def run_case(encrypted):
 
 run_case(False)
 run_case(True)
+run_case(False, dpi=True)
+run_case(True, dpi=True)
 print('WAV gateway integration checks passed')

@@ -172,8 +172,67 @@ static void test_usb_idle_recovery(void) {
     atomic_store(&usb_test_mode, 0);
 }
 
+static void test_dpi_sender(void) {
+    app_t *tx = calloc(1, sizeof *tx); assert(tx);
+    int pair[2]; assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) == 0);
+    tx->sock = pair[0];
+    pthread_mutex_init(&tx->dpi_lock, NULL);
+    unsigned char seed[32] = {0};
+    crypto_sign_seed_keypair(tx->dpi_pk, tx->dpi_sk, seed);
+    randombytes_buf(tx->dpi_session, 16);
+    randombytes_buf(tx->tx_session, 16);
+    randombytes_buf(tx->key, sizeof tx->key);
+    strcpy(tx->txid, "test");
+    tx->dpi_id = "HOST-A";
+    struct workspace workspace;
+    for (int encrypted = 0; encrypted <= 1; encrypted++) {
+        tx->encrypt_enabled = encrypted;
+        for (int type = PKT_IDLE; type <= PKT_END; type++) {
+            unsigned char payload[] = {0, 1, 255, 3}, wire[MAX_PACKET], plain[MAX_PACKET];
+            size_t len = type == PKT_AUDIO ? sizeof payload : 0;
+            assert(send_packet(tx, type, payload, len));
+            ssize_t n = recv(pair[1], wire, sizeof wire, MSG_DONTWAIT); assert(n > 0);
+            struct packet p;
+            assert(!decode(wire, n, &p));
+            assert(!verify(&workspace, &p, tx->dpi_pk));
+            assert(p.sequence == (uint64_t)(encrypted * 3 + type));
+            assert(!strcmp(p.label, "HOST-A"));
+            const uint8_t *inner = wire; size_t size = n;
+            assert(ptt_dpi_unwrap(&inner, &size, 0) == 1);
+            packet_hdr_t h; memcpy(&h, inner, sizeof h);
+            assert(h.type == type && ptt_header_valid(&h, size));
+            if (encrypted) {
+                unsigned long long plen;
+                assert(!crypto_aead_xchacha20poly1305_ietf_decrypt(plain, &plen, NULL,
+                    inner + sizeof h, ntohs(h.len), inner, sizeof h, h.nonce, tx->key));
+                assert(plen == len && !memcmp(plain, payload, len));
+            } else assert(!memcmp(inner + sizeof h, payload, len));
+            /* Endpoints intentionally do not verify the observer signature. */
+            wire[51 + strlen(tx->dpi_id)] ^= 1;
+            assert(verify(&workspace, &p, tx->dpi_pk));
+            inner = wire; size = n;
+            assert(ptt_dpi_unwrap(&inner, &size, 0) == 1);
+            wire[n] = 0; inner = wire; size = n + 1;
+            assert(ptt_dpi_unwrap(&inner, &size, 0) == -1);
+            inner = wire; size = n + 1;
+            assert(ptt_dpi_unwrap(&inner, &size, 1) == 1);
+        }
+    }
+    tx->dpi_sequence = UINT64_MAX;
+    assert(!send_packet(tx, PKT_IDLE, NULL, 0));
+    tx->dpi_id = NULL;
+    assert(send_packet(tx, PKT_IDLE, NULL, 0));
+    uint8_t wire[MAX_PACKET];
+    ssize_t n = recv(pair[1], wire, sizeof wire, MSG_DONTWAIT);
+    assert(n == sizeof(packet_hdr_t) + PTT_TAG_BYTES && !memcmp(wire, "UPTT", 4));
+    close(pair[0]); close(pair[1]);
+    sodium_memzero(tx->dpi_sk, sizeof tx->dpi_sk);
+    pthread_mutex_destroy(&tx->dpi_lock); free(tx);
+}
+
 int main(int argc, char **argv) {
     gst_init(&argc, &argv); assert(sodium_init() >= 0);
+    test_dpi_sender();
     test_mic_gain();
     test_usb_idle_recovery();
     app_t *tx = calloc(1, sizeof(*tx)), *rx = calloc(1, sizeof(*rx));

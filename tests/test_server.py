@@ -103,6 +103,22 @@ try:
     early_end = packet(kind=2, session=5, seq=1)
     a.send(early_end); expect(listener, early_end)
     a.send(packet(session=5)); expect(listener, packet(session=5))
+    # Observer-only metadata is relayed verbatim, even with an invalid signature.
+    def wrap(inner):
+        label = b'HOST-A'
+        return (b'MDPX\x01\x00' + struct.pack('!HBH', 115 + len(label), len(label), len(inner))
+                + b'\0' * 40 + label + b'\0' * 64 + inner)
+
+    signed_packet = wrap(packet(session=6))
+    a.send(signed_packet); expect(listener, signed_packet)
+    a.send(signed_packet + b'x'); absent(listener)
+    a.send(signed_packet[:-1]); absent(listener)
+    malformed = bytearray(signed_packet); malformed[8] = 255
+    a.send(malformed); absent(listener)
+    # A truncated oversized datagram must not become a valid inner packet.
+    a.send(signed_packet + b'x' * 3000); absent(listener)
+    signed_end = wrap(packet(kind=2, session=6, seq=1))
+    a.send(signed_end); expect(listener, signed_end)
     print('server arbitration, reordering, timeout and protocol tests passed')
 finally:
     for sock in clients:

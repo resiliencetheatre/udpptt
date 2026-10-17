@@ -12,6 +12,7 @@
 #include <time.h>
 #include <unistd.h>
 #include "ptt_protocol.h"
+#include "ptt_dpi.h"
 
 #define DEFAULT_SERVER_PORT 5000
 #define MAX_CLIENTS 128
@@ -113,7 +114,7 @@ int main(int argc, char **argv) {
     fflush(stdout);
     while (running) {
         uint8_t buf[MAX_PACKET]; struct sockaddr_in src; socklen_t src_len = sizeof(src);
-        ssize_t n = recvfrom(sock, buf, sizeof(buf), 0, (struct sockaddr *)&src, &src_len);
+        ssize_t n = recvfrom(sock, buf, sizeof(buf), MSG_TRUNC, (struct sockaddr *)&src, &src_len);
         int64_t now = now_ms();
         /* Expire before processing an arriving packet, including after a wait. */
         maintain(clients, &talker, hold, now);
@@ -125,10 +126,15 @@ int main(int argc, char **argv) {
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
             perror("recvfrom"); break;
         }
+        if ((size_t)n > sizeof buf) { invalid++; continue; }
+        const uint8_t *packet = buf;
+        size_t packet_size = (size_t)n;
+        int wrapped = ptt_dpi_unwrap(&packet, &packet_size, 0);
+        if (wrapped < 0) { invalid++; continue; }
         packet_hdr_t hdr;
-        if ((size_t)n < sizeof(hdr)) { invalid++; continue; }
-        memcpy(&hdr, buf, sizeof(hdr));
-        if (!ptt_header_valid(&hdr, (size_t)n)) {
+        if (packet_size < sizeof(hdr)) { invalid++; continue; }
+        memcpy(&hdr, packet, sizeof(hdr));
+        if (!ptt_header_valid(&hdr, packet_size)) {
             if (++invalid == 1 || invalid % 100 == 0) fprintf(stderr, "invalid packet: protocol v2 required (count=%lu)\n", invalid);
             continue;
         }
@@ -179,7 +185,7 @@ int main(int argc, char **argv) {
         }
         for (int i = 0; i < MAX_CLIENTS; ++i) {
             if (!clients[i].used || i == idx) continue;
-            ssize_t sent = sendto(sock, buf, sizeof(hdr) + ntohs(hdr.len), 0,
+            ssize_t sent = sendto(sock, buf, wrapped ? (size_t)n : sizeof(hdr) + ntohs(hdr.len), 0,
                 (struct sockaddr *)&clients[i].addr, sizeof(clients[i].addr));
             if (sent < 0) {
                 if (++send_errors == 1 || send_errors % 50 == 0) perror("forward sendto");

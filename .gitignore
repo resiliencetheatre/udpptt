@@ -17,3 +17,9 @@ Speech-Codebook.md
 ptt_wav_gate
 tests/ptt_wav_gate_sanitize
 usbptt
+metadata-proxy
+
+ptt_dpi_keygen
+tests/test_dpi
+tests/test_dpi_sanitize
+wireshark/mdpx.so

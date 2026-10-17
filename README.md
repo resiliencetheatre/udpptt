@@ -1493,3 +1493,63 @@ GPS bursts are 2.22 seconds, before additional device latency.
 
 See [audio preamble usage, protocol and validation](docs/audio-preamble.md) for
 GPS input, event format, reproducible experiments and current limitations.
+
+## Optional DPI source attribution
+
+`ptt_client` and `ptt_wav_gate` accept `--dpi-id LABEL` to wrap every outgoing
+PTT audio, idle and end packet in the metadata-proxy-compatible MDPX v1 format.
+The label is cleartext (1–63 ASCII letters, digits, dots, underscores or hyphens).
+An Ed25519 signature covers all wrapper metadata and the complete original PTT
+packet, including ciphertext and its authentication tag when `--encrypt` is used.
+This is separate from `--txid` and the room encryption password.
+
+Generate a persistent per-sender signing key once:
+
+```sh
+make
+mkdir -p "$HOME/.config/udpptt"
+./ptt_dpi_keygen --secret "$HOME/.config/udpptt/dpi.secret" \
+  --public "$HOME/.config/udpptt/dpi.public"
+./ptt_client 192.0.2.10 --dpi-id HOST-A --encrypt --key YOUR_ROOM_PASSWORD
+```
+
+The default signing seed is `~/.config/udpptt/dpi.secret`; override it with
+`--dpi-secret FILE`. A missing/malformed seed is a startup error. The seed file
+contains 64 lowercase hex characters and a newline, compatible with
+metadata-proxy keygen. New private files use mode 0600; keygen never overwrites
+existing files. Parent directories must already exist. If public-file creation
+fails after secret-file creation, the secret remains and the command reports
+failure. Keep the seed private and publish only the public key. No keys are
+created automatically during normal startup and none are bundled with UDPPTT.
+
+Observers map the public key to the label using a trusted channel and can
+verify captures with the [Wireshark plugin](wireshark/README.md). The original
+metadata-proxy UDP plugin and `inspect` command also understand these packets.
+A valid signature attributes the packet to the signing-key holder, not to a
+physical location or the observed IP/MAC address. Observers do not need the
+PTT encryption password. Historical/replayed packets still have valid signatures.
+
+Clients only validate and unwrap arriving metadata; the server reads the inner
+PTT header for arbitration and forwards the full signed packet unchanged.
+Neither checks DPI signatures, freshness or label trust. Existing encryption,
+jitter and arbitration rules remain in effect. `ptt_server` needs no new flags.
+
+Without `--dpi-id`, outgoing wire bytes remain unchanged and no signing key is
+needed. Updated receivers/server accept both formats. Older binaries cannot
+receive signed packets: upgrade the relay and receiving clients before enabling
+DPI signing. Existing unsupported older PTT protocol versions remain unsupported.
+
+The wrapper adds 115 + label length bytes. For HOST-A, a 1500-byte IPv4 path MTU
+allows 1351 bytes of inner PTT packet (including its 92-byte header and optional
+16-byte encryption tag). Blackfiber allows MTU minus wrapper bytes. Signed UDP
+senders request no IP fragmentation and report EMSGSIZE; Blackfiber checks the
+interface MTU. Oversized packets are dropped without truncating, splitting or
+falling back to unsigned traffic. There is no automatic codec/PMTU adaptation.
+The UDPPTT outer buffer cap is 2048 bytes. Signing happens once for every packet;
+keys are loaded only at startup. The MDPX random session is new per process,
+with its own 64-bit sequence independent of individual PTT presses.
+
+The self-contained codec in `dpi/` and the observer plugin are adapted from the
+local metadata-proxy reference. Building UDPPTT does not require that clone.
+See [wire format](dpi/PROTOCOL.md). Run `make test`, `make sanitize`, and, where
+Wireshark development files and TShark are available, `make test-wireshark`.
