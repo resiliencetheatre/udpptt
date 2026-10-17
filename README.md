@@ -2,7 +2,7 @@
 
 ## Abstract
 
-udpptt is a Linux push-to-talk audio system designed for operator communications, automated audio exchange, and embedded deployments. In its UDP client/server mode, each client maintains an active outbound UDP path with periodic idle packets, allowing the server to return incoming audio through the existing firewall or NAT mapping. The relay forwards the active talker’s stream without decoding its audio. Opus compression, configurable jitter buffering, forward error correction, and packet-loss concealment support operation over imperfect networks without requiring acknowledgements or retransmission.
+*udpptt is a Linux push-to-talk audio system designed for operator communications, automated audio exchange, and embedded deployments. In its UDP client/server mode, each client maintains an active outbound UDP path with periodic idle packets, allowing the server to return incoming audio through the existing firewall or NAT mapping. The relay forwards the active talker’s stream without decoding its audio. Opus compression, configurable jitter buffering, forward error correction, and packet-loss concealment support operation over imperfect networks without requiring acknowledgements or retransmission.
 
 Operation ranges from interactive desktop PTT to receive-only monitoring, automated WAV gateways, and direct Ethernet communication. Controls include keyboard input, USB PTT microphones such as the QX-18, USB HID headset buttons, embedded GPIO buttons exposed through Linux input devices, and external applications using a UNIX control socket. Optional XChaCha20-Poly1305 encryption protects audio between clients while authenticating protocol headers; the UDP relay does not need the shared room secret. In black fiber mode, clients exchange frames directly over Ethernet without IP addressing, routing, DHCP, or a server. Dedicated transmit-only and passive receive modes support deployment alongside hardware data diodes.
 
@@ -12,7 +12,7 @@ For cross-domain operations, optional --dpi-id metadata makes traffic explicitly
 
 This separation of confidential content from verifiable attribution provides a basis for boundary policies that recognize authorized communications and permit their passage. Enforcement requires a suitably configured inspection component: the current relay and clients do not verify DPI signatures or enforce label trust, freshness, or replay protection. A valid signature establishes signing-key attribution and packet integrity; it does not establish content safety or independently authorize a domain crossing.
 
-Built in C with Makefiles and established Linux libraries, udpptt supports a common software foundation from Debian desktops to Raspberry Pi and other embedded Linux targets. GStreamer, ALSA, Opus, and libsodium provide the audio and cryptographic components, while explicit device selection and headless operation suit Buildroot appliances, dedicated PTT terminals, and automated communications gateways.
+Built in C with Makefiles and established Linux libraries, udpptt supports a common software foundation from Debian desktops to Raspberry Pi and other embedded Linux targets. GStreamer, ALSA, Opus, and libsodium provide the audio and cryptographic components, while explicit device selection and headless operation suit Buildroot appliances, dedicated PTT terminals, and automated communications gateways.*
 
 
 ![Intro picture](img/udpptt.png "udpptt diagram")
