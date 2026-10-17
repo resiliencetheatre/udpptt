@@ -1496,7 +1496,7 @@ GPS input, event format, reproducible experiments and current limitations.
 
 ## Optional DPI source attribution
 
-![UDPPTT DPI metadata and signature verification in Wireshark](img/wireshark.png)
+![UDPPTT DPI metadata and signature verification](img/dpi-ptt.excalidraw.png)
 
 `ptt_client` and `ptt_wav_gate` accept `--dpi-id LABEL` to wrap every outgoing
 PTT audio, idle and end packet in the metadata-proxy-compatible MDPX v1 format.
@@ -1554,6 +1554,8 @@ In **Wireshark → Preferences → Protocols → MDPX**, set **Public-key trust 
 to the absolute path of `trusted.txt`. Set the UDP port to **5000** (or your
 configured PTT port), or use **Decode As → UDP port → MDPX**. After editing the
 trust file, reopen the capture or restart live capture to reload it.
+
+![UDPPTT DPI metadata and signature verification in Wireshark](img/wireshark.png)
 
 A valid signature attributes the packet to the signing-key holder, not to a
 physical location or the observed IP/MAC address. Observers do not need the
