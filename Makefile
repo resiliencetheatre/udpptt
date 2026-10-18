@@ -55,51 +55,11 @@ ptt_helper: ptt_helper.c
 ptt_hid: ptt_hid.c
 	$(CC) $(CFLAGS) -o $@ $<
 
+# Use named Make variables, e.g. make install SERVER_IP=host CALL_SIGN=desk ...
+export SERVER_IP CALL_SIGN WORD_OF_DAY DPI_ID
+export BINDIR DATADIR DESTDIR USER_SYSTEMD_DIR USER_CONFIG_DIR SERVICE_NAME ENV_NAME
 install: all
-	mkdir -p "$(DESTDIR)$(BINDIR)"
-	install -m 0755 ptt_dpi_keygen "$(DESTDIR)$(BINDIR)/ptt_dpi_keygen"
-	install -m 0755 ptt_client "$(DESTDIR)$(BINDIR)/ptt_client"
-	install -m 0755 ptt_wav_gate "$(DESTDIR)$(BINDIR)/ptt_wav_gate"
-	install -m 0755 ptt_server "$(DESTDIR)$(BINDIR)/ptt_server"
-	install -m 0755 ptt_helper "$(DESTDIR)$(BINDIR)/ptt_helper"
-	install -m 0755 ptt_hid "$(DESTDIR)$(BINDIR)/ptt_hid"
-
-	mkdir -p "$(DESTDIR)$(DATADIR)"
-	for f in $(DATAFILES); do \
-		if [ -f "$$f" ]; then \
-			install -m 0644 "$$f" "$(DESTDIR)$(DATADIR)/$$f"; \
-		fi; \
-	done
-
-	mkdir -p "$(USER_SYSTEMD_DIR)"
-	mkdir -p "$(USER_CONFIG_DIR)"
-
-	install -m 0644 systemd/udpptt.service "$(USER_SYSTEMD_DIR)/$(SERVICE_NAME)"
-
-	if [ ! -f "$(USER_CONFIG_DIR)/$(ENV_NAME)" ]; then \
-		install -m 0644 systemd/udpptt.env "$(USER_CONFIG_DIR)/$(ENV_NAME)"; \
-	fi
-
-	if [ -n "$(SUDO_USER)" ]; then \
-		chown -R "$(REAL_USER):$(REAL_USER)" "$(REAL_HOME)/.config/systemd" "$(REAL_HOME)/.config/udpptt"; \
-	fi
-
-	@echo
-	@echo "Installed binaries to: $(DESTDIR)$(BINDIR)"
-	@echo "Installed tone files to: $(DESTDIR)$(DATADIR)"
-	@echo "Installed user service to: $(USER_SYSTEMD_DIR)/$(SERVICE_NAME)"
-	@echo "Installed env file to: $(USER_CONFIG_DIR)/$(ENV_NAME)"
-	@echo "Target user: $(REAL_USER)"
-	@echo
-	@echo "Then run as that user:"
-	@echo "  systemctl --user daemon-reload"
-	@echo "  systemctl --user enable --now $(SERVICE_NAME)"
-	@echo
-	@echo "For HID PTT, run ptt_hid separately, for example:"
-	@echo "  ptt_hid --socket /tmp/udpptt.sock --key volumeup"
-	@echo
-	@echo "If keyboard or HID PTT is used, make sure that user can read the needed /dev/input/event* device:"
-	@echo "  sudo usermod -aG input $(REAL_USER)"
+	@python3 scripts/install.py
 
 install-gnome-extension: all
 	@if ! command -v gnome-shell >/dev/null 2>&1; then \
@@ -241,6 +201,7 @@ tests/test_telemetry: tests/test_telemetry.c ptt_telemetry.c ptt_telemetry.h
 test: all tests/test_dpi tests/test_recovery tests/test_client tests/test_telemetry
 	./tests/test_dpi
 	python3 tests/test_dpi_keys.py
+	python3 tests/test_install.py
 	./tests/test_telemetry
 	./tests/test_recovery
 	./tests/test_client

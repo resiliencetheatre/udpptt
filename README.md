@@ -40,45 +40,41 @@ embedded devices behind typical consumer routers or local firewalls.
 
 ## Installation with `make install`
 
-Build and install the binaries, tone files, and user service with:
+Build and install the AltGr keyboard PTT setup from your desktop session:
 
 ```sh
-make
-sudo make install
+make install SERVER_IP=198.51.100.10 CALL_SIGN=Alpha WORD_OF_DAY='your-room-secret' DPI_ID=station-a
 ```
 
-The install step does the following:
+Use named Make variables as shown, rather than positional arguments. This compiles
+first and requests sudo for installing system files and updating group membership.
+Python 3 and sudo are needed for installation. `sudo make install` with the same
+variables is also supported and targets the invoking desktop user.
 
-- installs `ptt_client`, `ptt_server`, `ptt_helper`, and `ptt_hid` to `/usr/local/bin`
-- installs `start.wav` and `stop.wav` to `/opt/udpptt`
-- installs a user systemd service file to:
+The installer installs the binaries to `/usr/local/bin`, tones to `/opt/udpptt`,
+and the service to `~/.config/systemd/user/udpptt.service`. It writes
+`~/.config/udpptt/udpptt.env` with your four supplied values, a 1000 ms AltGr delay,
+`/tmp/udpptt.sock`, and the generic `ABCDE` audio preamble. The service uses encryption,
+200 ms jitter, 10% FEC, DPI, and the runtime state file used by the indicator.
+The repository env file stays a template; connection details and the room secret
+come from the required Make parameters. Other PTT modes require manual configuration.
 
-```text
-~/.config/systemd/user/udpptt.service
-```
+It generates `~/.config/udpptt/dpi.secret` and `dpi.public` on first installation,
+preserves existing keys on repeat installations, and refuses incomplete key pairs.
+The env file and signing secret have mode 0600. Reinstalling replaces the service
+and env configuration with the template and supplied values; back up manual edits.
 
-- installs a per-user configuration file to:
-
-```text
-~/.config/udpptt/udpptt.env
-```
-
-The service is configured to run with:
-
-```text
-WorkingDirectory=/opt/udpptt
-```
-
-This means `ptt_client` will look for `start.wav` and `stop.wav` from `/opt/udpptt` when started through systemd.
-
-After installation, enable the user service:
+The installer adds your user to `input` if needed and runs
+`systemctl --user daemon-reload`. Run it from a logged-in desktop session so the
+user service manager is available. This is a live installer; `DESTDIR` is unsupported.
+Reboot after installation so input-group membership takes effect, then start manually:
 
 ```sh
-systemctl --user daemon-reload
-systemctl --user enable --now udpptt.service
+systemctl --user start udpptt
 ```
 
-To view logs:
+Installation does not start or enable the service. If it was already running,
+restart it to load the new configuration. To view logs:
 
 ```sh
 journalctl --user -u udpptt.service -f
@@ -265,6 +261,9 @@ sudo apt install build-essential pkg-config libsodium-dev libopus-dev \
 ```
 
 GStreamer 1.20 or newer is required for bounded `appsrc` buffering.
+`libasound2-dev` is required to build both `ptt_client` and `ptt_wav_gate`: it
+provides `alsa/asoundlib.h` and the ALSA library used directly by the client code.
+The runtime package `gstreamer1.0-alsa` does not replace this build dependency.
 
 ## WAV file gateway
 
@@ -276,7 +275,7 @@ or `./operator/operator --start-gate` to launch the configured gateway as well.
 `ptt_wav_gate` uses WAV files in place of the client's PTT button, microphone,
 and speaker. It does not launch Kokoro, whisper.cpp, or any other external
 binary. Build it with `make ptt_wav_gate` (also included in `make` and the install
-and uninstall targets). It uses the same GStreamer, Opus, and libsodium dependencies
+and uninstall targets). It uses the same ALSA, GStreamer, Opus, and libsodium dependencies
 as the client, including the GStreamer `wavparse`, `audioconvert`, and
 `audioresample` plugins. No audio hardware or desktop session is required.
 

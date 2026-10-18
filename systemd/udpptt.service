@@ -5,6 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+RuntimeDirectory=udpptt
 WorkingDirectory=/opt/udpptt
 EnvironmentFile=%h/.config/udpptt/udpptt.env
 ExecStart=/usr/local/bin/ptt_client ${SERVER_IP} --ptt-socket ${PTT_SOCKET} \
