@@ -1,0 +1,19 @@
+[Unit]
+Description=udpptt client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/udpptt
+EnvironmentFile=%h/.config/udpptt/udpptt.env
+ExecStart=/usr/local/bin/ptt_client ${SERVER_IP} --ptt-socket ${PTT_SOCKET} \
+--altgr-ptt-delay-ms ${ALTGR_PTT_DELAY_MS} --txid ${CALL_SIGN} \
+--encrypt --key ${WORD_OF_DAY} --jitter-ms 200 --fec-loss-percent 10 \
+--preamble-id ${AUDIO_PREAMBLE} --state-file %t/udpptt/state --rx-state-timeout-ms 1000 \
+--dpi-id ${DPI_ID}
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

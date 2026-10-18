@@ -74,32 +74,10 @@ install: all
 	mkdir -p "$(USER_SYSTEMD_DIR)"
 	mkdir -p "$(USER_CONFIG_DIR)"
 
-	printf '%s\n' \
-'[Unit]' \
-'Description=udpptt client' \
-'After=network-online.target' \
-'Wants=network-online.target' \
-'' \
-'[Service]' \
-'Type=simple' \
-'WorkingDirectory=$(DATADIR)' \
-'EnvironmentFile=%h/.config/udpptt/udpptt.env' \
-'ExecStart=$(BINDIR)/ptt_client $${SERVER_IP} --ptt-socket $${PTT_SOCKET} --altgr-ptt-delay-ms $${ALTGR_PTT_DELAY_MS} --txid $${CALL_SIGN} --encrypt --key $${WORD_OF_DAY}' \
-'Restart=always' \
-'RestartSec=3' \
-'' \
-'[Install]' \
-'WantedBy=default.target' \
-> "$(USER_SYSTEMD_DIR)/$(SERVICE_NAME)"
+	install -m 0644 systemd/udpptt.service "$(USER_SYSTEMD_DIR)/$(SERVICE_NAME)"
 
 	if [ ! -f "$(USER_CONFIG_DIR)/$(ENV_NAME)" ]; then \
-		printf '%s\n' \
-'SERVER_IP=198.51.100.10' \
-'CALL_SIGN=Alpha' \
-'WORD_OF_DAY=shared-room-secret' \
-'ALTGR_PTT_DELAY_MS=2000' \
-'PTT_SOCKET=/tmp/udpptt.sock' \
-> "$(USER_CONFIG_DIR)/$(ENV_NAME)"; \
+		install -m 0644 systemd/udpptt.env "$(USER_CONFIG_DIR)/$(ENV_NAME)"; \
 	fi
 
 	if [ -n "$(SUDO_USER)" ]; then \

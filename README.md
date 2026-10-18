@@ -22,111 +22,6 @@ Simple UDP push-to-talk audio test program using a client/server model.
 `udpptt` can also be used in a raw Ethernet "black fiber" mode, where clients exchange audio frames directly over a local Ethernet interface without IP addressing, routing, DHCP, or a UDP server.
 
 
-## WAV file gateway
-
-For an ncurses chat interface with Whisper receive transcription and Kokoro
-speech generation, see [operator](operator/README.md). Build with
-`make -C operator`, then run `./operator/operator` alongside an existing gateway,
-or `./operator/operator --start-gate` to launch the configured gateway as well.
-
-`ptt_wav_gate` uses WAV files in place of the client's PTT button, microphone,
-and speaker. It does not launch Kokoro, whisper.cpp, or any other external
-binary. Build it with `make ptt_wav_gate` (also included in `make` and the install
-and uninstall targets). It uses the same GStreamer, Opus, and libsodium dependencies
-as the client, including the GStreamer `wavparse`, `audioconvert`, and
-`audioresample` plugins. No audio hardware or desktop session is required.
-
-```sh
-./ptt_wav_gate 127.0.0.1 --port 5000 --txid WavGate \
-    --input-dir ./outgoing --output-dir ./incoming
-```
-
-Run `ptt_server` at the specified address and connect other clients as usual.
-The gateway creates `outgoing`, `outgoing/sent`, and `incoming` if needed (their
-parents must exist). Input and output must be different directories; one gateway
-may own a given input directory at a time.
-
-Write each complete WAV under a temporary name, close it, then rename it into
-the input directory with a `.wav` filename. When reusing a filename, wait until
-the previous input has moved to `sent/` before publishing the next one:
-
-```sh
-cp /path/to/generated.wav ./outgoing/.speech.tmp
-mv ./outgoing/.speech.tmp ./outgoing/speech.wav
-```
-
-The gateway scans every 250 ms, including files already present at startup. It
-considers regular, non-hidden `.wav` files in filename order after their size and
-modification metadata have remained stable for one second. Symlinks and
-subdirectories are ignored. The stability interval is a convenience, not a
-producer-completion guarantee: use the temporary-file-and-rename pattern above,
-and do not edit or replace published input files while they are queued.
-
-Supported RIFF/WAVE input is decoded with GStreamer and converted to 48 kHz mono
-PCM before transmission; ordinary PCM16 WAVs at 16, 24, 44.1, or 48 kHz and
-mono/stereo are suitable. The decoded snapshot is stored in a temporary disk file,
-so memory does not grow with recording length. Transmission uses the client's
-24 kbit/s Opus codec and real-time 20 ms frames; the final short frame is padded
-with silence. Each input file becomes a new PTT session. Malformed, empty, and
-truncated WAVs remain in place and are skipped until modified or the gateway is
-restarted, without blocking other queued files.
-
-After all audio and three END packets have been successfully sent, the original
-file moves to `outgoing/sent/` under its original name when available. If that
-name already exists, a numeric suffix is added: `speech.wav`, `speech_1.wav`,
-`speech_2.wav`, and so on. Existing archives are never overwritten, so producers
-can repeatedly publish the same input filename. Already-used suffixes are skipped;
-for example, if `sent/speech.wav` and `sent/speech_1.wav` exist, the next
-`speech.wav` is archived as `sent/speech_2.wav`.
-
-If an older gateway reports `archive destination exists/unavailable; leaving ...
-queued` when an archive of the same name exists, rebuild with
-`make ptt_wav_gate` and restart using the rebuilt binary. The queued input will
-then be processed without deleting earlier archives.
-
-Local transport errors are retried after about five seconds. Interrupted/failed
-sends retain their source WAV; retry can repeat a partially transmitted message.
-An archive failure after transmission stops the gateway with an error to avoid
-repeatedly sending the same file in that process.
-
-**Delivery semantics:** the existing UDP protocol has no acknowledgment or
-channel-grant response. `sent/` means successful local transmission, not confirmed
-receipt by the server or a listener. Packet loss, an unreachable server, or a
-busy server rejecting a competing talker cannot always be detected. The gateway
-uses the same best-effort semantics as `ptt_client`; it does not add a reliable
-file-transfer protocol. A crash between sending and archiving can also cause a
-repeat after restart.
-
-Each received PTT session produces its own
-`incoming/rx_YYYYMMDDTHHMMSS_nanoseconds_unique.wav`, including back-to-back or
-overlapping sessions. Output is uncompressed **48 kHz, mono, signed 16-bit
-little-endian PCM**. A hidden `.part` file is written first, then its WAV header
-is finalized, synced, and atomically renamed to `.wav`; downstream tools should
-watch only the final `rx_*.wav` files. END closes the recording after the jitter
-buffer drains; a lost END falls back to the receiver's two-second inactivity
-timeout. Packet-loss concealment and silence during gaps remain in the recording.
-Long sessions rotate every 30 minutes. Graceful shutdown finalizes current
-recordings; forced termination or disk errors may leave `.part` files for manual
-recovery. Receive write errors stop the gateway with a nonzero exit status.
-
-Network and audio recovery behavior is shared with `ptt_client`: UDP keepalives,
-protocol v2 validation, XChaCha20-Poly1305 encryption (`--encrypt --key PASSWORD`
-or `UDPPTT_KEY`), `--txid`, `--jitter-ms`, `--fec-loss-percent`, `--no-fec`,
-`--state-file`, and receive-only mode (`--rx-only`/`--no-ptt`). As with the client,
-local transmission suppresses reception. `--preamble-id ABCDE`, `--gps-file`, and
-`--telemetry-socket` work too; a preamble is transmitted before each WAV without
-a local audible monitor, and received preamble audio remains in the recording.
-Blackfiber transport and its MAC, EtherType, passive RX, and TX-only options are
-also supported (with the same raw-socket permissions as the client). Keyboard,
-HID/control-socket, ALSA, and local tone options do not apply to file mode.
-Use `./ptt_wav_gate --help` for the option summary.
-
-`make test` includes real relay/gateway round trips, encryption and wrong-key
-rejection, preambles, resampling, queue ownership, malformed/truncated files,
-repeated input filenames with preserved archives, separate back-to-back
-recordings, and interrupted sends.
-`make sanitize` runs the same integration checks with ASan/UBSan builds.
-
 ## UDP connection behavior
 
 The client keeps one UDP path continuously active by sending regular 
@@ -142,72 +37,6 @@ return path alive for server-to-client audio delivery. This makes the
 setup much simpler for roaming laptops, home networks, and small 
 embedded devices behind typical consumer routers or local firewalls.
 
-## Black fiber / raw Ethernet behavior
-
-![blackfiber picture](img/blackfiber.png "blackfiber")
-
-In black fiber mode, `ptt_client` does not use IP or UDP. Instead, it opens a Linux raw packet socket on a selected Ethernet interface and sends the same internal `udpptt` packet format directly inside custom Ethernet frames.
-
-This mode is intended for simple point-to-point or isolated Layer-2 links, for example:
-
-- a direct Ethernet cable between two devices
-- a private switch with only `udpptt` devices attached
-- a media converter / black fiber path where no IP infrastructure is desired
-- test setups where DHCP, IP addressing, routing, NAT, and firewall rules should be avoided completely
-
-Black fiber mode is selected with:
-
-```sh
-./ptt_client --blackfiber <iface> --txid <callsign>
-```
-
-Example:
-
-```sh
-./ptt_client --blackfiber eth0 --txid Alpha --encrypt --key 'shared room secret'
-```
-
-By default, black fiber mode sends to the Ethernet broadcast MAC address:
-
-```text
-ff:ff:ff:ff:ff:ff
-```
-
-This is convenient for two-node or small isolated Layer-2 test links. You can also send to a specific destination MAC address:
-
-```sh
-./ptt_client --blackfiber eth0 \
-    --bf-dst-mac 02:11:22:33:44:55 \
-    --txid Alpha \
-    --encrypt --key 'shared room secret'
-```
-
-The default custom Ethernet type is:
-
-```text
-0x88B5
-```
-
-You can override it if needed:
-
-```sh
-./ptt_client --blackfiber eth0 --bf-ethertype 0x88B6 --txid Alpha
-```
-
-All clients on the same black fiber segment must use the same Ethernet type. If encryption is enabled, all participating clients must also use the same room password.
-
-Black fiber mode does not use `ptt_server`. It is direct client-to-client Layer-2 transport. The existing UDP/server mode remains unchanged and is still used when `--blackfiber` is not specified.
-
-Packages typically needed on Debian/Ubuntu:
-
-```sh
-sudo apt install build-essential pkg-config libsodium-dev libopus-dev \
-    libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libasound2-dev \
-    gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
-    gstreamer1.0-plugins-bad gstreamer1.0-tools gstreamer1.0-alsa
-```
-
-GStreamer 1.20 or newer is required for bounded `appsrc` buffering.
 
 ## Installation with `make install`
 
@@ -367,6 +196,180 @@ UDPPTT_KEY='shared room secret' ./ptt_client 198.51.100.10 --txid Bravo --rx-onl
 - The `--rx-only` and `--no-ptt` options disable keyboard PTT handling and microphone capture, but still keep the client connected for receive/playback.
 - The client can optionally play local `start.wav` and `stop.wav` tones on PTT press/release if those files exist in the current working directory.
 - The `--ptt-socket` option enables external PTT control through a UNIX datagram socket. This is used by `ptt_helper` and `ptt_hid`.
+
+
+
+## Black fiber / raw Ethernet behavior
+
+![blackfiber picture](img/blackfiber.png "blackfiber")
+
+In black fiber mode, `ptt_client` does not use IP or UDP. Instead, it opens a Linux raw packet socket on a selected Ethernet interface and sends the same internal `udpptt` packet format directly inside custom Ethernet frames.
+
+This mode is intended for simple point-to-point or isolated Layer-2 links, for example:
+
+- a direct Ethernet cable between two devices
+- a private switch with only `udpptt` devices attached
+- a media converter / black fiber path where no IP infrastructure is desired
+- test setups where DHCP, IP addressing, routing, NAT, and firewall rules should be avoided completely
+
+Black fiber mode is selected with:
+
+```sh
+./ptt_client --blackfiber <iface> --txid <callsign>
+```
+
+Example:
+
+```sh
+./ptt_client --blackfiber eth0 --txid Alpha --encrypt --key 'shared room secret'
+```
+
+By default, black fiber mode sends to the Ethernet broadcast MAC address:
+
+```text
+ff:ff:ff:ff:ff:ff
+```
+
+This is convenient for two-node or small isolated Layer-2 test links. You can also send to a specific destination MAC address:
+
+```sh
+./ptt_client --blackfiber eth0 \
+    --bf-dst-mac 02:11:22:33:44:55 \
+    --txid Alpha \
+    --encrypt --key 'shared room secret'
+```
+
+The default custom Ethernet type is:
+
+```text
+0x88B5
+```
+
+You can override it if needed:
+
+```sh
+./ptt_client --blackfiber eth0 --bf-ethertype 0x88B6 --txid Alpha
+```
+
+All clients on the same black fiber segment must use the same Ethernet type. If encryption is enabled, all participating clients must also use the same room password.
+
+Black fiber mode does not use `ptt_server`. It is direct client-to-client Layer-2 transport. The existing UDP/server mode remains unchanged and is still used when `--blackfiber` is not specified.
+
+Packages typically needed on Debian/Ubuntu:
+
+```sh
+sudo apt install build-essential pkg-config libsodium-dev libopus-dev \
+    libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libasound2-dev \
+    gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-bad gstreamer1.0-tools gstreamer1.0-alsa
+```
+
+GStreamer 1.20 or newer is required for bounded `appsrc` buffering.
+
+## WAV file gateway
+
+For an ncurses chat interface with Whisper receive transcription and Kokoro
+speech generation, see [operator](operator/README.md). Build with
+`make -C operator`, then run `./operator/operator` alongside an existing gateway,
+or `./operator/operator --start-gate` to launch the configured gateway as well.
+
+`ptt_wav_gate` uses WAV files in place of the client's PTT button, microphone,
+and speaker. It does not launch Kokoro, whisper.cpp, or any other external
+binary. Build it with `make ptt_wav_gate` (also included in `make` and the install
+and uninstall targets). It uses the same GStreamer, Opus, and libsodium dependencies
+as the client, including the GStreamer `wavparse`, `audioconvert`, and
+`audioresample` plugins. No audio hardware or desktop session is required.
+
+```sh
+./ptt_wav_gate 127.0.0.1 --port 5000 --txid WavGate \
+    --input-dir ./outgoing --output-dir ./incoming
+```
+
+Run `ptt_server` at the specified address and connect other clients as usual.
+The gateway creates `outgoing`, `outgoing/sent`, and `incoming` if needed (their
+parents must exist). Input and output must be different directories; one gateway
+may own a given input directory at a time.
+
+Write each complete WAV under a temporary name, close it, then rename it into
+the input directory with a `.wav` filename. When reusing a filename, wait until
+the previous input has moved to `sent/` before publishing the next one:
+
+```sh
+cp /path/to/generated.wav ./outgoing/.speech.tmp
+mv ./outgoing/.speech.tmp ./outgoing/speech.wav
+```
+
+The gateway scans every 250 ms, including files already present at startup. It
+considers regular, non-hidden `.wav` files in filename order after their size and
+modification metadata have remained stable for one second. Symlinks and
+subdirectories are ignored. The stability interval is a convenience, not a
+producer-completion guarantee: use the temporary-file-and-rename pattern above,
+and do not edit or replace published input files while they are queued.
+
+Supported RIFF/WAVE input is decoded with GStreamer and converted to 48 kHz mono
+PCM before transmission; ordinary PCM16 WAVs at 16, 24, 44.1, or 48 kHz and
+mono/stereo are suitable. The decoded snapshot is stored in a temporary disk file,
+so memory does not grow with recording length. Transmission uses the client's
+24 kbit/s Opus codec and real-time 20 ms frames; the final short frame is padded
+with silence. Each input file becomes a new PTT session. Malformed, empty, and
+truncated WAVs remain in place and are skipped until modified or the gateway is
+restarted, without blocking other queued files.
+
+After all audio and three END packets have been successfully sent, the original
+file moves to `outgoing/sent/` under its original name when available. If that
+name already exists, a numeric suffix is added: `speech.wav`, `speech_1.wav`,
+`speech_2.wav`, and so on. Existing archives are never overwritten, so producers
+can repeatedly publish the same input filename. Already-used suffixes are skipped;
+for example, if `sent/speech.wav` and `sent/speech_1.wav` exist, the next
+`speech.wav` is archived as `sent/speech_2.wav`.
+
+If an older gateway reports `archive destination exists/unavailable; leaving ...
+queued` when an archive of the same name exists, rebuild with
+`make ptt_wav_gate` and restart using the rebuilt binary. The queued input will
+then be processed without deleting earlier archives.
+
+Local transport errors are retried after about five seconds. Interrupted/failed
+sends retain their source WAV; retry can repeat a partially transmitted message.
+An archive failure after transmission stops the gateway with an error to avoid
+repeatedly sending the same file in that process.
+
+**Delivery semantics:** the existing UDP protocol has no acknowledgment or
+channel-grant response. `sent/` means successful local transmission, not confirmed
+receipt by the server or a listener. Packet loss, an unreachable server, or a
+busy server rejecting a competing talker cannot always be detected. The gateway
+uses the same best-effort semantics as `ptt_client`; it does not add a reliable
+file-transfer protocol. A crash between sending and archiving can also cause a
+repeat after restart.
+
+Each received PTT session produces its own
+`incoming/rx_YYYYMMDDTHHMMSS_nanoseconds_unique.wav`, including back-to-back or
+overlapping sessions. Output is uncompressed **48 kHz, mono, signed 16-bit
+little-endian PCM**. A hidden `.part` file is written first, then its WAV header
+is finalized, synced, and atomically renamed to `.wav`; downstream tools should
+watch only the final `rx_*.wav` files. END closes the recording after the jitter
+buffer drains; a lost END falls back to the receiver's two-second inactivity
+timeout. Packet-loss concealment and silence during gaps remain in the recording.
+Long sessions rotate every 30 minutes. Graceful shutdown finalizes current
+recordings; forced termination or disk errors may leave `.part` files for manual
+recovery. Receive write errors stop the gateway with a nonzero exit status.
+
+Network and audio recovery behavior is shared with `ptt_client`: UDP keepalives,
+protocol v2 validation, XChaCha20-Poly1305 encryption (`--encrypt --key PASSWORD`
+or `UDPPTT_KEY`), `--txid`, `--jitter-ms`, `--fec-loss-percent`, `--no-fec`,
+`--state-file`, and receive-only mode (`--rx-only`/`--no-ptt`). As with the client,
+local transmission suppresses reception. `--preamble-id ABCDE`, `--gps-file`, and
+`--telemetry-socket` work too; a preamble is transmitted before each WAV without
+a local audible monitor, and received preamble audio remains in the recording.
+Blackfiber transport and its MAC, EtherType, passive RX, and TX-only options are
+also supported (with the same raw-socket permissions as the client). Keyboard,
+HID/control-socket, ALSA, and local tone options do not apply to file mode.
+Use `./ptt_wav_gate --help` for the option summary.
+
+`make test` includes real relay/gateway round trips, encryption and wrong-key
+rejection, preambles, resampling, queue ownership, malformed/truncated files,
+repeated input filenames with preserved archives, separate back-to-back
+recordings, and interrupted sends.
+`make sanitize` runs the same integration checks with ASan/UBSan builds.
 
 ## Protocol v2 and audio recovery
 
@@ -1210,8 +1213,13 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+WorkingDirectory=/opt/udpptt
 EnvironmentFile=%h/.config/udpptt/udpptt.env
-ExecStart=/usr/local/bin/ptt_client ${SERVER_IP} --altgr-ptt-delay-ms ${ALTGR_PTT_DELAY_MS} --txid ${CALL_SIGN} --encrypt --key ${WORD_OF_DAY}
+ExecStart=/usr/local/bin/ptt_client ${SERVER_IP} --ptt-socket ${PTT_SOCKET} \
+--altgr-ptt-delay-ms ${ALTGR_PTT_DELAY_MS} --txid ${CALL_SIGN} \
+--encrypt --key ${WORD_OF_DAY} --jitter-ms 200 --fec-loss-percent 10 \
+--preamble-id ${AUDIO_PREAMBLE} --state-file %t/udpptt/state --rx-state-timeout-ms 1000 \
+--dpi-id ${DPI_ID}
 Restart=always
 RestartSec=3
 
@@ -1232,13 +1240,16 @@ udpptt.env path and content:
 ```
 
 ```
-SERVER_IP=198.51.100.10
-CALL_SIGN=Alpha
-WORD_OF_DAY=shared-room-secret
-ALTGR_PTT_DELAY_MS=2000
+SERVER_IP=[SERVER_IP]
+CALL_SIGN=ABCDE
+WORD_OF_DAY=shared-room
+ALTGR_PTT_DELAY_MS=1000
+PTT_SOCKET=/tmp/udpptt.sock
+AUDIO_PREAMBLE=ABCDE
+DPI_ID=ABCDE
 ```
 
-Install service file
+Install service file manually or use `make install` to use templates from `systemd` directory.
 
 ```
 mkdir -p ~/.config/systemd/user
